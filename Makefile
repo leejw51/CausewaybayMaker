@@ -10,7 +10,7 @@ MAX_TOKENS ?= 512
 RUN := $(CONDA) run --no-capture-output -n $(ENV)
 export HF_HUB_ENABLE_HF_TRANSFER=1
 
-.PHONY: help setup download run chat bench server clean clean-model
+.PHONY: help setup download run chat bench server clean clean-model rust-build rust-run rust-chat rust-bench
 
 help:
 	@echo "make setup      - create conda env '$(ENV)' and install mlx-lm"
@@ -19,6 +19,8 @@ help:
 	@echo "make chat       - interactive chat"
 	@echo "make bench      - measure tokens/sec"
 	@echo "make server     - OpenAI-compatible API on :8080"
+	@echo "make rust-build - build the Rust (mlx-rs) runner"
+	@echo "make rust-run / rust-chat / rust-bench - same as above, in Rust"
 	@echo "make clean      - remove conda env"
 	@echo "Override model: make run MODEL=mlx-community/Qwen3.5-9B-8bit"
 
@@ -46,3 +48,18 @@ clean:
 
 clean-model:
 	rm -rf ~/.cache/huggingface/hub/models--$(subst /,--,$(MODEL))
+
+# ---- Rust (mlx-rs) ----
+RUST_BIN := rust/target/release/qwen35
+
+rust-build:
+	cd rust && cargo build --release
+
+rust-run: rust-build
+	$(RUST_BIN) --model $(MODEL) --max-tokens $(MAX_TOKENS) --prompt "$(PROMPT)"
+
+rust-chat: rust-build
+	$(RUST_BIN) --model $(MODEL) --max-tokens $(MAX_TOKENS) --chat
+
+rust-bench: rust-build
+	$(RUST_BIN) --model $(MODEL) --bench
