@@ -4,13 +4,14 @@ CONDA      ?= /opt/anaconda3/bin/conda
 ENV        ?= qwen35
 PY_VER     ?= 3.12
 MODEL      ?= mlx-community/Qwen3.5-9B-4bit
+MODEL2     ?= mlx-community/Qwen3.5-4B-4bit
 PROMPT     ?= Explain quantum entanglement in 3 sentences.
 MAX_TOKENS ?= 512
 
 RUN := $(CONDA) run --no-capture-output -n $(ENV)
 export HF_HUB_ENABLE_HF_TRANSFER=1
 
-.PHONY: help setup download run chat bench server clean clean-model rust-build rust-run rust-chat rust-bench
+.PHONY: help setup download run chat bench server clean clean-model rust-build rust-run rust-chat rust-chat2 rust-bench
 
 help:
 	@echo "make setup      - create conda env '$(ENV)' and install mlx-lm"
@@ -21,6 +22,7 @@ help:
 	@echo "make server     - OpenAI-compatible API on :8080"
 	@echo "make rust-build - build the Rust (mlx-rs) runner"
 	@echo "make rust-run / rust-chat / rust-bench - same as above, in Rust"
+	@echo "make rust-chat2 - Rust chat with the smaller, faster $(MODEL2)"
 	@echo "make clean      - remove conda env"
 	@echo "Override model: make run MODEL=mlx-community/Qwen3.5-9B-8bit"
 
@@ -60,6 +62,9 @@ rust-run: rust-build
 
 rust-chat: rust-build
 	$(RUST_BIN) --model $(MODEL) --max-tokens $(MAX_TOKENS) --chat
+
+rust-chat2: rust-build
+	$(RUST_BIN) --model $(MODEL2) --max-tokens $(MAX_TOKENS) --chat
 
 rust-bench: rust-build
 	$(RUST_BIN) --model $(MODEL) --bench

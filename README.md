@@ -35,6 +35,7 @@ Rust:
 ```sh
 make rust-run PROMPT="Explain how a rainbow forms."
 make rust-chat
+make rust-chat2   # 4B model: faster, less memory
 make rust-bench
 ```
 
@@ -48,6 +49,7 @@ The first Rust build compiles MLX from source and takes a few minutes.
 | `download` | Download the model from Hugging Face |
 | `run` / `chat` / `bench` | Python: one prompt, interactive chat, throughput |
 | `rust-build` | Build the Rust runner |
+| `rust-chat2` | Rust chat with `mlx-community/Qwen3.5-4B-4bit` (~129 tok/s, 2.5 GB) |
 | `rust-run` / `rust-chat` / `rust-bench` | Rust: one prompt, interactive chat, throughput |
 | `server` | OpenAI-compatible API on `127.0.0.1:8080` |
 | `clean` / `clean-model` | Remove the conda env / the cached model |
