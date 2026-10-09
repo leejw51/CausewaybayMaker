@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run Qwen3.5-9B on Apple Silicon with MLX (Metal GPU, unified memory).
+"""Run Qwen (3.5 / 3.8, MLX 4-bit) on Apple Silicon with MLX (Metal GPU, unified memory).
 
 The model is downloaded from Hugging Face on first use and cached in
 ~/.cache/huggingface/hub.
