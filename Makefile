@@ -8,6 +8,9 @@ ENV        ?= qwen35
 PY_VER     ?= 3.12
 PROMPT     ?= Explain quantum entanglement in 3 sentences.
 MAX_TOKENS ?= 512
+# Whisper model for `make audio` (any mlx-community/whisper-* repo).
+WHISPER    ?= mlx-community/whisper-large-v3-turbo
+WHISPER_LANG ?= en
 
 RUN := $(CONDA) run --no-capture-output -n $(ENV)
 export HF_XET_HIGH_PERFORMANCE=1
@@ -19,7 +22,7 @@ else
 PICK := scripts/choose-model.sh
 endif
 
-.PHONY: help setup download run chat bench server clean clean-model rust-build rust-run rust-chat rust-chat2 rust-bench
+.PHONY: help setup download run chat bench server clean clean-model rust-build rust-run rust-chat rust-chat2 rust-bench audio audio2
 
 help:
 	@echo "make setup      - create conda env '$(ENV)' and install mlx-lm"
@@ -31,6 +34,8 @@ help:
 	@echo "make rust-build - build the Rust (mlx-rs) runner"
 	@echo "make rust-run / rust-chat / rust-bench - same as above, in Rust"
 	@echo "make rust-chat2 - Rust chat with the small, fast Qwen3.5-4B"
+	@echo "make audio      - live microphone -> text with Whisper on MLX (Rust example; DEVICE=AirPods, WAV=file.wav)"
+	@echo "make audio2     - same, using the AirPods as the microphone"
 	@echo "make clean      - remove conda env"
 	@echo
 	@echo "Each run target asks which model to use:"
@@ -79,3 +84,14 @@ rust-chat2:
 
 rust-bench: rust-build
 	@M=$$($(PICK)) || exit 1; $(RUST_BIN) --model $$M --bench
+
+# ---- Audio (Whisper speech-to-text, rust/examples/audio) ----
+# make audio                  listen on the mic continuously; each utterance is transcribed when you pause
+# make audio DEVICE=AirPods   pick the input device by name
+# make audio WAV=clip.wav     transcribe a WAV file instead
+audio:
+	cd rust && cargo run --release --example audio -- --model $(WHISPER) --language $(WHISPER_LANG) \
+		$(if $(WAV),--wav $(abspath $(WAV))) $(if $(DEVICE),--device "$(DEVICE)")
+
+audio2:
+	$(MAKE) audio DEVICE=AirPods

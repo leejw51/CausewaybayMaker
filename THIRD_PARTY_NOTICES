@@ -6,7 +6,13 @@ rust/src/kernel.rs and rust/src/model.rs are derived from mlx-lm
   - mlx_lm/models/gated_delta.py  (Gated DeltaNet Metal kernel)
   - mlx_lm/models/qwen3_5.py, mlx_lm/models/qwen3_next.py  (Qwen3.5 model)
 
-mlx-lm is distributed under the following license:
+rust/examples/audio/whisper.rs and rust/examples/audio/mel.rs are derived from
+mlx-whisper (https://github.com/ml-explore/mlx-examples/tree/main/whisper),
+version 0.4.x: mlx_whisper/whisper.py, audio.py, decoding.py, tokenizer.py.
+rust/assets/mel_80.npy and mel_128.npy are the mel filterbanks shipped with
+mlx-whisper (generated with librosa; originally from OpenAI Whisper, MIT).
+
+mlx-lm and mlx-whisper are distributed under the following license:
 
 MIT License
 
