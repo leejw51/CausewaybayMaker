@@ -1,0 +1,13 @@
+[package]
+name = "jarvis"
+version = "0.1.0"
+edition = "2024"
+description = "Voice assistant on Apple Silicon: Whisper ears, Qwen3.5 brain and Qwen3-VL eyes on MLX, Kokoro voice, Apple's on-device model as router, Grok in the cloud"
+
+[dependencies]
+anyhow = "1.0.104"
+base64 = "0.22"
+clap = { version = "4.6.7", features = ["derive"] }
+libc = "0.2"
+qwen35 = { path = "../rust" }
+serde_json = "1.0.151"

@@ -20,7 +20,7 @@ pub fn mel_filters(n_mels: i32) -> Result<Array> {
         128 => include_bytes!("../../assets/mel_128.npy"),
         n => bail!("unsupported n_mels {n}"),
     };
-    crate::npy::parse_npy(bytes)
+    super::npy::parse_npy(bytes)
 }
 
 /// Periodic Hann window (numpy.hanning(N + 1)[:-1]).

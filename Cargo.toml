@@ -1,0 +1,4 @@
+# Cargo workspace: the Qwen/Whisper library and runner (rust/) and the Jarvis voice assistant (jarvis/).
+[workspace]
+members = ["rust", "jarvis"]
+resolver = "3"

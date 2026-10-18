@@ -10,10 +10,9 @@ mlx-rs = { version = "0.32.0", features = ["safetensors"] }
 mlx-sys = "0.6.0"
 serde_json = "1.0.151"
 tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }
-
-# Only used by examples/audio (Whisper speech-to-text).
-[dev-dependencies]
+# Speech to text (src/audio): microphone capture, WAV files, Whisper weights, clean shutdown.
 cpal = "0.18"
 half = "2"
 hound = "3.5"
+libc = "0.2"
 zip = { version = "9", default-features = false, features = ["deflate"] }
