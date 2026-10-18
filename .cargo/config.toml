@@ -1,0 +1,4 @@
+# Keep build output where it has always been (rust/target), so the MLX build is reused and
+# the Makefile paths stay valid.
+[build]
+target-dir = "rust/target"

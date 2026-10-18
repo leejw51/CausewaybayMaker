@@ -22,7 +22,7 @@ else
 PICK := scripts/choose-model.sh
 endif
 
-.PHONY: help setup download run chat bench server clean clean-model rust-build rust-run rust-chat rust-chat2 rust-bench audio audio2
+.PHONY: help setup download run chat bench server clean clean-model rust-build rust-run rust-chat rust-chat2 rust-bench audio audio2 jarvis test
 
 help:
 	@echo "make setup      - create conda env '$(ENV)' and install mlx-lm"
@@ -36,6 +36,8 @@ help:
 	@echo "make rust-chat2 - Rust chat with the small, fast Qwen3.5-4B"
 	@echo "make audio      - live microphone -> text with Whisper on MLX (Rust example; DEVICE=AirPods, WAV=file.wav)"
 	@echo "make audio2     - same, using the AirPods as the microphone"
+	@echo "make jarvis     - voice assistant: Whisper, Qwen3.5, Qwen3-VL and Kokoro on MLX; Grok via XAI_API_KEY on \"AI ...\""
+	@echo "make test       - unit tests + end-to-end checks with synthesized recordings (scripts/test.sh)"
 	@echo "make clean      - remove conda env"
 	@echo
 	@echo "Each run target asks which model to use:"
@@ -44,7 +46,7 @@ help:
 
 setup:
 	@$(CONDA) env list | grep -q "^$(ENV) " || $(CONDA) create -y -n $(ENV) python=$(PY_VER)
-	$(RUN) pip install -U mlx-lm "huggingface_hub[cli]"
+	$(RUN) pip install -U mlx-lm "huggingface_hub[cli]" mlx-vlm mlx-audio "misaki[en]" mflux "pillow<12"
 
 download:
 	@M=$$($(PICK)) || exit 1; $(RUN) hf download $$M
@@ -89,9 +91,31 @@ rust-bench: rust-build
 # make audio                  listen on the mic continuously; each utterance is transcribed when you pause
 # make audio DEVICE=AirPods   pick the input device by name
 # make audio WAV=clip.wav     transcribe a WAV file instead
+# An earlier run that is still alive (e.g. suspended with Ctrl-Z) is killed first so it frees the mic.
 audio:
+	@scripts/stop-audio.sh
 	cd rust && cargo run --release --example audio -- --model $(WHISPER) --language $(WHISPER_LANG) \
 		$(if $(WAV),--wav $(abspath $(WAV))) $(if $(DEVICE),--device "$(DEVICE)")
 
 audio2:
 	$(MAKE) audio DEVICE=AirPods
+
+# ---- Jarvis voice assistant (jarvis/, its own crate in the workspace) ----
+# The real rules live in jarvis/Makefile (`cd jarvis && make help`); this forwards to them.
+# make jarvis                 listen, transcribe, answer out loud; "AI, ..." goes to Grok (XAI_API_KEY)
+# make jarvis WAV=q.wav       replay a recording through the pipeline (no microphone needed)
+# make jarvis BRAIN=mlx MODEL=mlx-community/Qwen3.5-4B-4bit     think with Qwen3.5 on MLX instead of Apple's model
+# make jarvis JARVIS_FLAGS="--no-speak --local-only"
+jarvis:
+	@$(MAKE) -C jarvis run CONDA=$(CONDA) ENV=$(ENV) WHISPER=$(WHISPER) WHISPER_LANG=$(WHISPER_LANG) \
+		$(if $(BRAIN),BRAIN=$(BRAIN)) $(if $(MODEL),MODEL=$(MODEL)) $(if $(VLM),VLM=$(VLM)) $(if $(TTS),TTS=$(TTS)) $(if $(IMAGINE),IMAGINE=$(IMAGINE)) \
+		$(if $(WAV),WAV=$(abspath $(WAV))) $(if $(DEVICE),DEVICE="$(DEVICE)") FLAGS="$(JARVIS_FLAGS)"
+
+# ---- Tests ----
+# make test        everything (a few minutes; one Grok call if XAI_API_KEY is set)
+# make test-quick  unit tests, helpers and the stop script only
+test:
+	scripts/test.sh
+
+test-quick:
+	scripts/test.sh quick

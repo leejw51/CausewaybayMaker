@@ -15,7 +15,7 @@ use mlx_rs::{Array, Dtype};
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
-use crate::npy::load_npz;
+use super::npy::load_npz;
 
 #[derive(Debug, Clone)]
 pub struct Dims {
@@ -326,7 +326,8 @@ impl Whisper {
     }
 
     /// Greedy decode: returns the generated text token ids (no specials).
-    pub fn decode(&self, xa: &Array, prompt: &[i32], rules: &Rules, mut on_token: impl FnMut(i32)) -> Result<Vec<i32>> {
+    /// Greedy decode; `on_token` returns false to stop early (e.g. the user is quitting).
+    pub fn decode(&self, xa: &Array, prompt: &[i32], rules: &Rules, mut on_token: impl FnMut(i32) -> bool) -> Result<Vec<i32>> {
         let mut cache = self.make_cache();
         let max_new = (self.dims.n_text_ctx as usize).saturating_sub(prompt.len() + 1);
         let mut out = Vec::new();
@@ -338,7 +339,9 @@ impl Whisper {
                 break;
             }
             out.push(tok);
-            on_token(tok);
+            if !on_token(tok) {
+                break;
+            }
             logits = self.decoder.forward(&[tok], xa, &mut cache)?;
         }
         Ok(out)
