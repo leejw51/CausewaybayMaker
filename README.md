@@ -1,18 +1,22 @@
 # CausewaybayMaker
 
-Run Qwen locally on Apple Silicon with [MLX](https://github.com/ml-explore/mlx), from Python or Rust.
+Run Qwen and Inkling 2 Mini locally on Apple Silicon with [MLX](https://github.com/ml-explore/mlx),
+from Python or Rust. Inkling 2 Mini also reads pictures.
 
-Models are the 4-bit MLX builds from `mlx-community`, downloaded from Hugging Face on first use.
-Every run target asks which one to use (Enter picks the 9B):
+The Qwen models are the 4-bit MLX builds from `mlx-community`, downloaded from Hugging Face on
+first use; Inkling 2 Mini is read from Ollama's store. Every run target asks which one to use
+(Enter picks the 9B):
 
 | # | Model | Repo | Size | Generation | Prompt | Memory |
 |---|---|---|---|---|---|---|
 | 1 | Qwen3.5 9B (default) | [`mlx-community/Qwen3.5-9B-4bit`](https://huggingface.co/mlx-community/Qwen3.5-9B-4bit) | 6 GB | ~75–90 tok/s | ~330–420 tok/s | 5.2 GB |
 | 2 | Qwen3.5 4B | [`mlx-community/Qwen3.5-4B-4bit`](https://huggingface.co/mlx-community/Qwen3.5-4B-4bit) | 2.5 GB | ~129 tok/s | | 2.5 GB |
 | 3 | Qwen3.8 27B | [`mlx-community/Qwen3.8-27B-4bit`](https://huggingface.co/mlx-community/Qwen3.8-27B-4bit) | 16 GB | ~26 tok/s | ~110–140 tok/s | 15.4 GB |
+| 4 | Inkling 2 Mini (text and pictures, Rust only) | [`inkling-2-mini:26b-a5b-nvfp4`](https://ollama.com/library/inkling-2-mini) | 20 GB | ~55–130 tok/s | ~1,500–2,000 tok/s | 20.6 GB |
 
-Measured on an M5 Max. Python (`mlx-lm`) and Rust (`mlx-rs`) run within a few tok/s of each
-other. The 8-bit 9B (`mlx-community/Qwen3.5-9B-8bit`) runs at ~37 tok/s and uses 9.7 GB.
+Measured on an M5 Max. For the Qwen models, Python (`mlx-lm`) and Rust (`mlx-rs`) run within a
+few tok/s of each other. Inkling 2 Mini's speed depends on the answer (see
+[its section](#inkling-2-mini-rust-from-ollamas-store)). The 8-bit 9B (`mlx-community/Qwen3.5-9B-8bit`) runs at ~37 tok/s and uses 9.7 GB.
 
 ## Requirements
 
@@ -38,7 +42,7 @@ Choose a model (set MODEL=... to skip this prompt):
   1) Qwen3.5 9B      mlx-community/Qwen3.5-9B-4bit    6 GB    default
   2) Qwen3.5 4B      mlx-community/Qwen3.5-4B-4bit    2.5 GB  fastest, least memory
   3) Qwen3.8 27B     mlx-community/Qwen3.8-27B-4bit   16 GB   strongest, slowest
-  4) Inkling 2 Mini  inkling-2-mini:26b-a5b-nvfp4     20 GB   Rust runner, from Ollama (ollama pull first)
+  4) Inkling 2 Mini  inkling-2-mini:26b-a5b-nvfp4     20 GB   reads images (IMAGE=file); Rust runner, from Ollama (ollama pull first)
 Model [1]:
 ```
 
@@ -343,48 +347,68 @@ Security); without it the eyes only see the wallpaper.
 |---|---|
 | `setup` | Create the conda env and install dependencies |
 | `download` | Download a model from Hugging Face |
-| `run` / `chat` / `bench` | Python: one prompt, interactive chat, throughput |
+| `run` / `chat` / `bench` | One prompt, interactive chat, throughput: Python for the Qwen models, the Rust runner for Inkling 2 Mini |
 | `rust-build` | Build the Rust runner |
 | `rust-chat2` | Rust chat with `mlx-community/Qwen3.5-4B-4bit`, no prompt |
 | `rust-run` / `rust-chat` / `rust-bench` | Rust: one prompt, interactive chat, throughput |
-| `inkling-run` / `inkling-chat` | Rust: Inkling 2 Mini on MLX, weights from Ollama's store |
+| `inkling-run` / `inkling-chat` | Rust: Inkling 2 Mini on MLX, weights from Ollama's store (no menu) |
 | `ollama-pull` / `ollama-run` / `ollama-chat` | Inkling 2 Mini (`OLLAMA_MODEL=`) through Ollama |
 | `audio` | Rust: live microphone (or `WAV=`) to text with Whisper on MLX |
 | `audio2` | `make audio DEVICE=AirPods` |
 | `jarvis` | Rust: voice assistant (Whisper, Qwen3.5, Qwen3-VL, Kokoro on MLX; Grok on "AI ...") |
 | `server` | OpenAI-compatible API on `127.0.0.1:8080` |
+| `test` / `test-quick` | Unit tests and end-to-end checks / the ones that run no model |
 | `clean` / `clean-model` | Remove the conda env / a cached model |
 
 All model-using targets show the model menu unless `MODEL=` is set.
 Variables: `MODEL`, `PROMPT`, `MAX_TOKENS`, e.g. `make rust-chat MODEL=mlx-community/Qwen3.5-9B-8bit`.
+`IMAGE=file` shows Inkling 2 Mini a picture (`run`, `chat`, `rust-run`, `rust-chat`, `inkling-run`,
+`inkling-chat`); with another model it is refused.
 `make audio` uses `WHISPER`, `WHISPER_LANG`, `DEVICE`, `WAV` instead.
 
 ## Rust runner options
 
 ```
 rust/target/release/qwen35 [--model REPO_OR_DIR] [--prompt TEXT] [--max-tokens N]
-                           [--temp T] [--top-k K] [--think] [--chat] [--bench]
-                           [--no-kernel] [--print-ids]
+                           [--temp T] [--top-k K] [--think] [--chat] [--system TEXT] [--bench]
+                           [--image FILE]... [--no-kernel] [--print-ids]
 ```
 
+- `--model` is a Hugging Face repo, a local directory, or an Ollama model name without a slash
+  (`inkling-2-mini:26b-a5b-nvfp4`).
 - `--temp 0` is greedy decoding.
-- `--think` enables Qwen's thinking mode (slower).
+- `--think` enables Qwen's thinking mode (slower); for Inkling it raises the thinking effort.
+- `--image` (Inkling only, repeatable) shows the model a picture with the prompt; in `--chat` it
+  goes with the first message, and `/image FILE` on a line of its own attaches one to the next.
 - `--no-kernel` uses the plain-ops recurrence instead of the Metal kernel (for verification).
 
 ## Tests
 
 ```sh
-make test          # unit tests, helpers, stop script, then end-to-end runs on synthesized speech
-make test-quick    # the first three only
+make test          # unit tests, helpers, stop script, then end-to-end runs of the models
+make test-quick    # the checks that run no model
 ```
 
-`scripts/test.sh` makes its recordings with `say`, so no microphone is needed, and speech is
+The unit tests (`cargo test`) cover, for Inkling 2 Mini's pictures: padding to whole tokens, the
+checkerboard under transparency, scaling, EXIF orientation, the encoder's three Metal kernels
+against the plain formulas, the prompt's chunk sizes, the expert sum, and `/image` paths.
+
+With the model in Ollama's store, `scripts/test.sh` then draws a page of text, a bar chart and a
+3000x2250 photo and has the Rust runner read them: one prompt, `make run IMAGE=...` through the
+menu's route, and a chat with a mistyped file, two pictures in one message and a picture in a
+later turn. If Ollama is running it asks it the same question about the same picture and fails
+when the Rust runner generates slower, or reads the picture more than 10% slower; for that it
+stops Ollama's copy of the model and loads it again.
+
+For the audio example and Jarvis, `scripts/test.sh` makes its recordings with `say`, so no microphone is needed, and speech is
 written to files or played at volume 0. It checks transcription, on-device answers, echo
 filtering, interruption, the screen path, typed requests, pictures (Apple Vision on a file and
 on a URL, FLUX generation, Vision spotting a dog and a face in generated pictures), the cloud
 policy (one Grok call when `XAI_API_KEY` is set, otherwise skipped), and that Ctrl-C and
 Ctrl-Z mid-reply exit at once. The Python helpers have their own tests in
-`jarvis/python/test_helpers.py`, which the suite runs as well.
+`jarvis/python/test_helpers.py`, which the suite runs as well. A model that is not in the cache
+yet is downloaded on the way (Whisper 1.6 GB, FLUX about 9 GB). The screen check needs Screen
+Recording permission for the terminal and fails without it.
 
 ## Layout
 
@@ -397,6 +421,13 @@ rust/src/kernel.rs  Gated DeltaNet recurrence as a custom Metal kernel
 rust/src/lib.rs                 The qwen35 library: model, llm, hf, audio (used by the runner, the example and Jarvis)
 rust/src/llm.rs                 Prompt format, sampling, pipelined decoding, multi-turn Chat with a persistent cache
 rust/src/hf.rs                  Model files: local dir, Hugging Face cache, or `hf download`
+rust/src/inkling/mod.rs         Inkling 2 Mini: the model, its cache, prompt reading
+rust/src/inkling/ops.rs         Quantized expert products and the fused Metal kernels
+rust/src/inkling/draft.rs, speculate.rs  The draft network and speculative decoding
+rust/src/inkling/vision.rs      The image encoder: reading a picture, the vision transformer
+rust/src/inkling/ollama.rs      Weights and tokenizer from Ollama's store
+rust/examples/inkling/main.rs   Checks and timings for Inkling 2 Mini (against Ollama, by stage)
+scripts/test.sh                 `make test`
 rust/src/audio/listen.rs        Mic capture (cpal), VAD segmentation, WAV input, Ctrl-C/Ctrl-Z shutdown
 rust/src/audio/stt.rs           Whisper transcriber
 rust/src/audio/whisper.rs       Whisper encoder/decoder and greedy decoding on mlx-rs
