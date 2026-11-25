@@ -1,5 +1,6 @@
 //! The brain: Apple's on-device foundation model (default, through the one `apple-ai` process
-//! that also routes), or Qwen3.5 on MLX in this process with `--brain mlx`.
+//! that also routes), or a local model on MLX in this process with `--brain mlx` (Qwen3.5 from
+//! Hugging Face, or Inkling 2 from Ollama's store).
 
 use anyhow::{Result, anyhow};
 use qwen35::audio::listen::quit_requested;
@@ -55,7 +56,7 @@ impl Brain {
     pub fn name(&self) -> &'static str {
         match self {
             Self::Apple => "Apple on-device model",
-            Self::Mlx(_) => "Qwen3.5 on MLX",
+            Self::Mlx(chat) => chat.engine.format.label(),
         }
     }
 

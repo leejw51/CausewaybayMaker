@@ -22,7 +22,7 @@ else
 PICK := scripts/choose-model.sh
 endif
 
-.PHONY: help setup download run chat bench server clean clean-model rust-build rust-run rust-chat rust-chat2 rust-bench audio audio2 jarvis test
+.PHONY: help setup download run chat bench server clean clean-model rust-build rust-run rust-chat rust-chat2 rust-bench inkling-run inkling-chat ollama-pull ollama-run ollama-chat audio audio2 jarvis test
 
 help:
 	@echo "make setup      - create conda env '$(ENV)' and install mlx-lm"
@@ -34,6 +34,8 @@ help:
 	@echo "make rust-build - build the Rust (mlx-rs) runner"
 	@echo "make rust-run / rust-chat / rust-bench - same as above, in Rust"
 	@echo "make rust-chat2 - Rust chat with the small, fast Qwen3.5-4B"
+	@echo "make inkling-chat - Rust (MLX) chat with Inkling 2 Mini, read from Ollama's store; also inkling-run"
+	@echo "make ollama-chat - the same model through Ollama itself; also ollama-pull / ollama-run"
 	@echo "make audio      - live microphone -> text with Whisper on MLX (Rust example; DEVICE=AirPods, WAV=file.wav)"
 	@echo "make audio2     - same, using the AirPods as the microphone"
 	@echo "make jarvis     - voice assistant: Whisper, Qwen3.5, Qwen3-VL and Kokoro on MLX; Grok via XAI_API_KEY on \"AI ...\""
@@ -48,20 +50,30 @@ setup:
 	@$(CONDA) env list | grep -q "^$(ENV) " || $(CONDA) create -y -n $(ENV) python=$(PY_VER)
 	$(RUN) pip install -U mlx-lm "huggingface_hub[cli]" mlx-vlm mlx-audio "misaki[en]" mflux "pillow<12"
 
+# A model name without a slash is an Ollama model (Inkling 2 Mini): mlx-lm cannot run it, so
+# these targets hand it to the Rust runner, which reads it from Ollama's store.
 download:
-	@M=$$($(PICK)) || exit 1; $(RUN) hf download $$M
+	@M=$$($(PICK)) || exit 1; case $$M in */*) $(RUN) hf download $$M ;; *) ollama pull $$M ;; esac
 
 run:
-	@M=$$($(PICK)) || exit 1; $(RUN) python python/qwen.py --model $$M --max-tokens $(MAX_TOKENS) --prompt "$(PROMPT)"
+	@M=$$($(PICK)) || exit 1; case $$M in \
+	  */*) $(RUN) python python/qwen.py --model $$M --max-tokens $(MAX_TOKENS) --prompt "$(PROMPT)" ;; \
+	  *) $(MAKE) --no-print-directory rust-run MODEL=$$M ;; esac
 
 chat:
-	@M=$$($(PICK)) || exit 1; $(RUN) python python/qwen.py --model $$M --max-tokens $(MAX_TOKENS) --chat
+	@M=$$($(PICK)) || exit 1; case $$M in \
+	  */*) $(RUN) python python/qwen.py --model $$M --max-tokens $(MAX_TOKENS) --chat ;; \
+	  *) $(MAKE) --no-print-directory rust-chat MODEL=$$M ;; esac
 
 bench:
-	@M=$$($(PICK)) || exit 1; $(RUN) python python/qwen.py --model $$M --bench
+	@M=$$($(PICK)) || exit 1; case $$M in \
+	  */*) $(RUN) python python/qwen.py --model $$M --bench ;; \
+	  *) $(MAKE) --no-print-directory rust-bench MODEL=$$M ;; esac
 
 server:
-	@M=$$($(PICK)) || exit 1; $(RUN) mlx_lm.server --model $$M --port 8080
+	@M=$$($(PICK)) || exit 1; case $$M in \
+	  */*) $(RUN) mlx_lm.server --model $$M --port 8080 ;; \
+	  *) echo "$$M is an Ollama model, not an mlx-lm one: serve it with Ollama." >&2; exit 1 ;; esac
 
 clean:
 	$(CONDA) env remove -y -n $(ENV)
@@ -87,6 +99,28 @@ rust-chat2:
 rust-bench: rust-build
 	@M=$$($(PICK)) || exit 1; $(RUST_BIN) --model $$M --bench
 
+# ---- Ollama (models that are not MLX builds) ----
+# Inkling 2 Mini: https://ollama.com/library/inkling-2-mini (26B total, 5B active, NVFP4, ~20 GB)
+# make ollama-pull | ollama-run PROMPT="..." | ollama-chat      override with OLLAMA_MODEL=...
+OLLAMA_MODEL ?= inkling-2-mini:26b-a5b-nvfp4
+
+ollama-pull:
+	ollama pull $(OLLAMA_MODEL)
+
+ollama-run:
+	ollama run $(OLLAMA_MODEL) "$(PROMPT)"
+
+ollama-chat:
+	ollama run $(OLLAMA_MODEL)
+
+# The same model run natively by the Rust runner (rust/src/inkling), weights read from Ollama's
+# store (pull it first). Stop Ollama's copy first if it is loaded: both need ~21 GB.
+inkling-run: rust-build
+	$(RUST_BIN) --model $(OLLAMA_MODEL) --max-tokens 2048 --prompt "$(PROMPT)"
+
+inkling-chat: rust-build
+	$(RUST_BIN) --model $(OLLAMA_MODEL) --max-tokens 2048 --chat
+
 # ---- Audio (Whisper speech-to-text, rust/examples/audio) ----
 # make audio                  listen on the mic continuously; each utterance is transcribed when you pause
 # make audio DEVICE=AirPods   pick the input device by name
@@ -105,6 +139,7 @@ audio2:
 # make jarvis                 listen, transcribe, answer out loud; "AI, ..." goes to Grok (XAI_API_KEY)
 # make jarvis WAV=q.wav       replay a recording through the pipeline (no microphone needed)
 # make jarvis BRAIN=mlx MODEL=mlx-community/Qwen3.5-4B-4bit     think with Qwen3.5 on MLX instead of Apple's model
+# make jarvis BRAIN=mlx MODEL=inkling-2-mini:26b-a5b-nvfp4      ... or with Inkling 2 Mini (from Ollama's store)
 # make jarvis JARVIS_FLAGS="--no-speak --local-only"
 jarvis:
 	@$(MAKE) -C jarvis run CONDA=$(CONDA) ENV=$(ENV) WHISPER=$(WHISPER) WHISPER_LANG=$(WHISPER_LANG) \

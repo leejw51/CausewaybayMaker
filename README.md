@@ -35,9 +35,10 @@ Each of these prints the model menu and waits for a number:
 
 ```
 Choose a model (set MODEL=... to skip this prompt):
-  1) Qwen3.5 9B   mlx-community/Qwen3.5-9B-4bit    6 GB    default
-  2) Qwen3.5 4B   mlx-community/Qwen3.5-4B-4bit    2.5 GB  fastest, least memory
-  3) Qwen3.8 27B  mlx-community/Qwen3.8-27B-4bit   16 GB   strongest, slowest
+  1) Qwen3.5 9B      mlx-community/Qwen3.5-9B-4bit    6 GB    default
+  2) Qwen3.5 4B      mlx-community/Qwen3.5-4B-4bit    2.5 GB  fastest, least memory
+  3) Qwen3.8 27B     mlx-community/Qwen3.8-27B-4bit   16 GB   strongest, slowest
+  4) Inkling 2 Mini  inkling-2-mini:26b-a5b-nvfp4     20 GB   Rust runner, from Ollama (ollama pull first)
 Model [1]:
 ```
 
@@ -61,6 +62,79 @@ make rust-bench
 ```
 
 The first Rust build compiles MLX from source and takes a few minutes.
+
+### Inkling 2 Mini (Rust, from Ollama's store)
+
+[`inkling-2-mini:26b-a5b-nvfp4`](https://ollama.com/library/inkling-2-mini) is a routed-expert model
+(26B total, 5B active per token; NVFP4/MXFP8 experts, ~20 GB). The Rust runner runs it natively on
+MLX (`rust/src/inkling`, ported from Ollama's MLX runner) and reads the weights straight from
+Ollama's store, so pull it with Ollama once. It is entry 4 of the menu above: picking it in
+`make chat`, `make run` or `make bench` starts the Rust runner, since mlx-lm cannot run it. Or:
+
+```sh
+make ollama-pull                      # ollama pull inkling-2-mini:26b-a5b-nvfp4
+make inkling-run PROMPT="..."         # Rust: one prompt
+make inkling-chat                     # Rust: chat (thinking is shown dimmed, then the answer)
+make rust-chat MODEL=inkling-2-mini:26b-a5b-nvfp4   # same as inkling-chat
+```
+
+Text only: the image encoder is not loaded. Generation is speculative, as in Ollama: the model's
+draft network (`rust/src/inkling/draft.rs`) proposes up to seven tokens, the model checks them all
+in one pass, and the run it agrees with is kept along with its own next token. Measured on an M5
+Max: greedy, thinking effort 0 on both, each answer run to its end, two runs of each prompt,
+alternating the two runners:
+
+| Generation (tok/s) | Rust, speculative | Ollama 0.40.18 |
+|---|---|---|
+| Prose answer ("how a bill becomes law") | 65.1–69.3 | 61.5–61.6 |
+| Code answer (a Python CSV parser) | 91.1–96.4 | 75.7–76.0 |
+| Short question ("whats is bitcoin?") | 65.7–66.2 | 62.3–63.9 |
+| Summary of a 1,860-token text | 77.4–79.4 | 81.7–83.8 |
+| Korean answer (Bitcoin, in detail) | 54.9–56.2 | 50.2–51.1 |
+
+Generation is 4 to 25% faster than Ollama's on four of these and about 5% slower on the long
+summary. Without the draft network (`INKLING_DRAFT=0`) the Rust runner makes ~50 tok/s. Ollama
+reads a prompt about twice as fast (1,860 tokens: ~2,560 tok/s against ~1,260), and it keeps the
+cache of a prompt it has seen. With the runner's default sampling (`--temp 0.7 --top-k 20`) the
+prose answer ran at 64 tok/s; at temperature 1.5, where only 36% of proposals were accepted, it
+still made 59 tok/s. Peak memory is 20.6 GB, 22 GB with the long prompt. Loading takes about 2 s
+longer than without the draft network: it times one round at each depth, which also compiles the
+Metal kernels before the first prompt.
+
+A pass over one token takes ~20 ms. Each further token in the same pass costs 2.5 to 4 ms, so a
+proposal pays off when it is accepted more than about a quarter of the time; 40 to 60% are, giving
+2 to 3.6 tokens per pass. How many tokens to propose is learned as it decodes, from the measured
+cost of each depth and the measured acceptance at each position
+(`rust/src/inkling/speculate.rs`); `INKLING_STATS=1` prints the tally. Most of a further token's
+cost is its expert products, and the tokens of one pass often share experts (four tokens use about
+60% as many distinct experts as routes), so a Metal kernel decodes each expert's weights once and
+multiplies them with every token that routed to it (`shared_qmm` in `rust/src/inkling/ops.rs`).
+
+The text is the model's own: greedy decoding keeps a proposal only where the model picks the same
+token, and sampling uses rejection sampling, which draws from the model's distribution. A pass
+over several tokens rounds differently from single-token passes, so a greedy answer can part ways
+with the one-token-per-pass answer at a near-tie (in one 300-token test, after 162 tokens), and
+because the depth follows measured timings, two speculative runs can differ in the same way.
+`INKLING_DEPTH=3` fixes the depth, which makes greedy runs repeatable, and `INKLING_DRAFT=0` turns
+the draft network off.
+
+Against Ollama (`rust/examples/inkling --score`, an 1,840-token prompt), the most likely next token
+agrees on 74 of 80 tokens, the rest being near-ties, and log-probabilities differ by 0.10 on
+average: rounding differs from Ollama's kernels. Scored four or eight tokens per pass, as a
+speculative round does, it agrees on 76 and 74 of the 80. The model always writes a short thinking section
+before answering (shown dimmed in the chat; Jarvis speaks only the answer); `--think` raises its
+effort level from 0 to 0.9.
+
+If Ollama has the model loaded, stop it first (`ollama stop inkling-2-mini:26b-a5b-nvfp4`): two
+copies do not fit in 36 GB.
+
+Ollama itself, for comparison:
+
+```sh
+make ollama-run PROMPT="..."
+make ollama-chat
+make ollama-chat OLLAMA_MODEL=qwen3.5:9b   # any other Ollama model
+```
 
 ## Audio agent (microphone to text)
 
@@ -178,6 +252,7 @@ make jarvis JARVIS_FLAGS="--no-speak"        # text only
 make jarvis JARVIS_FLAGS="--local-only"      # never use the cloud
 make jarvis WHISPER_LANG=ko                   # Korean in, Korean out
 make jarvis BRAIN=mlx MODEL=mlx-community/Qwen3.5-4B-4bit   # Qwen3.5 on MLX as the brain
+make jarvis BRAIN=mlx MODEL=inkling-2-mini:26b-a5b-nvfp4    # Inkling 2 Mini on MLX as the brain
 ```
 
 ```
@@ -228,6 +303,8 @@ Security); without it the eyes only see the wallpaper.
 | `rust-build` | Build the Rust runner |
 | `rust-chat2` | Rust chat with `mlx-community/Qwen3.5-4B-4bit`, no prompt |
 | `rust-run` / `rust-chat` / `rust-bench` | Rust: one prompt, interactive chat, throughput |
+| `inkling-run` / `inkling-chat` | Rust: Inkling 2 Mini on MLX, weights from Ollama's store |
+| `ollama-pull` / `ollama-run` / `ollama-chat` | Inkling 2 Mini (`OLLAMA_MODEL=`) through Ollama |
 | `audio` | Rust: live microphone (or `WAV=`) to text with Whisper on MLX |
 | `audio2` | `make audio DEVICE=AirPods` |
 | `jarvis` | Rust: voice assistant (Whisper, Qwen3.5, Qwen3-VL, Kokoro on MLX; Grok on "AI ...") |

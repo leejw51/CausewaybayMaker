@@ -3,6 +3,7 @@
 
 pub mod audio;
 pub mod hf;
+pub mod inkling;
 pub mod kernel;
 pub mod llm;
 pub mod model;

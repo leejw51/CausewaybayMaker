@@ -1,6 +1,7 @@
 #!/bin/sh
-# Interactive model picker. Prints the chosen Hugging Face repo id on stdout;
-# the menu itself goes to stderr so the caller can capture the result.
+# Interactive model picker. Prints the chosen model on stdout (a Hugging Face repo id, or an
+# Ollama model name: no slash, run by the Rust runner from Ollama's store); the menu itself
+# goes to stderr so the caller can capture the result.
 #
 #   scripts/choose-model.sh          # prompt (Enter = first entry)
 #   scripts/choose-model.sh --list   # print the table and exit
@@ -10,6 +11,7 @@ MODELS='
 mlx-community/Qwen3.5-9B-4bit   | Qwen3.5 9B  | 6 GB   | default
 mlx-community/Qwen3.5-4B-4bit   | Qwen3.5 4B  | 2.5 GB | fastest, least memory
 mlx-community/Qwen3.8-27B-4bit  | Qwen3.8 27B | 16 GB  | strongest, slowest
+inkling-2-mini:26b-a5b-nvfp4    | Inkling 2 Mini | 20 GB | Rust runner, from Ollama (ollama pull first)
 '
 
 rows() { printf '%s\n' "$MODELS" | sed -e '/^[[:space:]]*$/d' -e 's/ *| */|/g'; }
@@ -19,7 +21,7 @@ list() {
     i=0
     rows | while IFS='|' read -r r name size note; do
         i=$((i + 1))
-        printf '  %d) %-12s %-32s %-7s %s\n' "$i" "$name" "$r" "$size" "$note"
+        printf '  %d) %-15s %-32s %-7s %s\n' "$i" "$name" "$r" "$size" "$note"
     done
 }
 
