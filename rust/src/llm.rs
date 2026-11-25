@@ -256,6 +256,15 @@ impl Engine {
         }
     }
 
+    /// Get ready for images: load the image encoder and run it once, so the first image is
+    /// read at full speed (Inkling only).
+    pub fn warm_images(&self) -> Result<()> {
+        match &self.model {
+            Backend::Inkling(m) => m.warm_vision(),
+            _ => anyhow::bail!("{} does not take images here", self.format.label()),
+        }
+    }
+
     /// Generate from `prompt`, handing decoded text to `on_text` as it arrives (partial UTF-8
     /// sequences are held back until complete); returns the whole text and the statistics.
     /// `on_text` returns false to stop generating (the reply so far is returned).
@@ -430,12 +439,14 @@ pub struct Chat {
     prefix: &'static str,
     started: bool,
     tokens: usize,
+    /// The image messages of the turn being written (their embeddings wait in the cache).
+    images: String,
 }
 
 impl Chat {
     pub fn new(engine: Engine, system: Option<String>, think: bool, max_tokens: usize) -> Self {
         let cache = engine.make_cache();
-        Self { engine, cache, system, think, max_tokens, prefix: "", started: false, tokens: 0 }
+        Self { engine, cache, system, think, max_tokens, prefix: "", started: false, tokens: 0, images: String::new() }
     }
 
     /// Forget the conversation (the system prompt is sent again with the next turn).
@@ -444,6 +455,7 @@ impl Chat {
         self.prefix = "";
         self.started = false;
         self.tokens = 0;
+        self.images.clear();
     }
 
     /// Tokens held in the cache so far (prompt and generated).
@@ -451,19 +463,37 @@ impl Chat {
         self.tokens
     }
 
+    /// Show the model an image file with the next message, before its text (Inkling only).
+    /// The image is read and encoded now, so a file that cannot be read fails here and
+    /// leaves the conversation as it was.
+    pub fn attach_image(&mut self, path: &std::path::Path) -> Result<()> {
+        let message = self.engine.attach_image(&mut self.cache, path)?;
+        self.images.push_str(&message);
+        Ok(())
+    }
+
+    /// Images attached to the next message.
+    pub fn images_attached(&self) -> usize {
+        match &self.cache {
+            Cache::Inkling(c) => c.images(),
+            _ => 0,
+        }
+    }
+
+    /// Take back the images attached to the next message.
+    pub fn drop_images(&mut self) {
+        self.images.clear();
+        if let Cache::Inkling(c) = &mut self.cache {
+            c.drop_images();
+        }
+    }
+
     /// Send one user message; the reply streams to `on_text` and is returned whole.
     /// `on_text` returns false to cut the reply short.
     pub fn reply(&mut self, user: &str, on_text: impl FnMut(&str) -> bool) -> Result<(String, Stats)> {
-        self.reply_with_images(user, &[], on_text)
-    }
-
-    /// `reply` with image files shown to the model before the message's text (Inkling only).
-    pub fn reply_with_images(&mut self, user: &str, images: &[std::path::PathBuf], on_text: impl FnMut(&str) -> bool) -> Result<(String, Stats)> {
         let format = self.engine.format;
         let mut prompt = if self.started { self.prefix.to_string() } else { format.start(self.system.as_deref(), self.think) };
-        for image in images {
-            prompt.push_str(&self.engine.attach_image(&mut self.cache, image)?);
-        }
+        prompt.push_str(&std::mem::take(&mut self.images));
         prompt.push_str(&format.user(user, self.think));
         let (text, stats) = self.engine.generate_text(&prompt, &mut self.cache, self.max_tokens, on_text)?;
         self.started = true;
@@ -471,6 +501,18 @@ impl Chat {
         self.prefix = format.close(stats.eos_in_cache);
         self.tokens += stats.prompt_tokens + stats.gen_tokens;
         Ok((text, stats))
+    }
+
+    /// `reply` with image files shown to the model before the message's text (Inkling only).
+    /// If one cannot be read, none is attached and nothing is sent.
+    pub fn reply_with_images(&mut self, user: &str, images: &[std::path::PathBuf], on_text: impl FnMut(&str) -> bool) -> Result<(String, Stats)> {
+        for image in images {
+            if let Err(e) = self.attach_image(image) {
+                self.drop_images();
+                return Err(e);
+            }
+        }
+        self.reply(user, on_text)
     }
 }
 

@@ -15,6 +15,13 @@
 //!   INKLING_SHARED=1 ...                          check the shared-expert products against MLX's
 //!   INKLING_ROLLBACK=1 ...                        check that taking rows back out of the cache
 //!                                                 matches never having fed them (long prompt)
+//!   INKLING_PREFILL=325,702,1860 ...              prompt reading time at these lengths (best of
+//!                                                 three; INKLING_PREFILL_ALL=1 prints each);
+//!                                                 with INKLING_TRACE=1, the time by stage
+//!                                                 (every stage is evaluated on its own, which
+//!                                                 adds about a quarter to the total)
+//!   INKLING_VISION=photo.jpg ...                  image encoding time, six times over
+//!                                                 (INKLING_VISION_SAVE=file writes the embeddings)
 
 use std::time::Instant;
 
@@ -65,6 +72,45 @@ fn main() -> Result<()> {
     }
     if std::env::var_os("INKLING_MICRO").is_some() {
         return model.microbench();
+    }
+    if let Ok(path) = std::env::var("INKLING_VISION") {
+        // Image encoding time, after the first (which loads the encoder).
+        let vision = model.vision()?;
+        let pixels = vision.read(std::path::Path::new(&path))?;
+        for i in 0..6 {
+            let t = Instant::now();
+            let out = vision.encode(&pixels)?;
+            let ms = t.elapsed().as_secs_f64() * 1e3;
+            let f = out.as_dtype(mlx_rs::Dtype::Float32)?;
+            if let Ok(save) = std::env::var("INKLING_VISION_SAVE") {
+                f.eval()?;
+                let bytes: Vec<u8> = f.as_slice::<f32>().iter().flat_map(|v| v.to_le_bytes()).collect();
+                std::fs::write(&save, bytes)?;
+            }
+            println!("encode {i}: {} tokens in {ms:.1} ms (mean |x| {:.6}, sum {:.4})", out.dim(0), f.abs()?.mean(None)?.item::<f32>(), f.sum(None)?.item::<f32>());
+        }
+        return Ok(());
+    }
+    if std::env::var_os("INKLING_PREFILL").is_some() {
+        // Prompt reading speed at several lengths (the prompt's tokens, repeated).
+        let lengths: Vec<usize> = std::env::var("INKLING_PREFILL").unwrap().split(',').filter_map(|v| v.parse().ok()).collect();
+        for &len in &lengths {
+            let fed: Vec<i32> = ids.iter().cycle().take(len).copied().collect();
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let mut cache = model.make_cache();
+                let t = Instant::now();
+                let logits = model.forward(&Array::from_slice(&fed, &[1, len as i32]), &mut cache)?;
+                mlx_rs::transforms::eval([&logits])?;
+                cache.eval_state()?;
+                best = best.min(t.elapsed().as_secs_f64());
+                if std::env::var_os("INKLING_PREFILL_ALL").is_some() {
+                    println!("  {len} tokens: {:.3} s", t.elapsed().as_secs_f64());
+                }
+            }
+            println!("prefill {len} tokens: {:.3} s, {:.0} tok/s; peak memory so far {:.1} GB", best, len as f64 / best, mlx_rs::memory::peak_memory().unwrap_or(0) as f64 / 1e9);
+        }
+        return Ok(());
     }
     if std::env::var_os("INKLING_PROFILE").is_some() {
         let mut cache = model.make_cache();

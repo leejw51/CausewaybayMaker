@@ -104,7 +104,7 @@ pub fn slice_update(src: &Array, update: &Array, start: &[i32], stop: &[i32]) ->
     }
 }
 
-struct Kernel(sys::mlx_fast_metal_kernel);
+pub(crate) struct Kernel(sys::mlx_fast_metal_kernel);
 
 // SAFETY: the kernel object is immutable after creation; MLX takes its own reference per launch.
 unsafe impl Send for Kernel {}
@@ -121,17 +121,17 @@ fn vec_string(names: &[&str]) -> sys::mlx_vector_string {
     }
 }
 
-struct Launch<'a> {
-    inputs: &'a [&'a Array],
-    ints: &'a [(&'a str, i32)],
-    dtypes: &'a [(&'a str, Dtype)],
-    grid: (i32, i32, i32),
-    group: (i32, i32, i32),
-    outputs: &'a [(&'a [i32], Dtype)],
+pub(crate) struct Launch<'a> {
+    pub inputs: &'a [&'a Array],
+    pub ints: &'a [(&'a str, i32)],
+    pub dtypes: &'a [(&'a str, Dtype)],
+    pub grid: (i32, i32, i32),
+    pub group: (i32, i32, i32),
+    pub outputs: &'a [(&'a [i32], Dtype)],
 }
 
 impl Kernel {
-    fn new(name: &str, inputs: &[&str], outputs: &[&str], header: &str, source: &str) -> Self {
+    pub(crate) fn new(name: &str, inputs: &[&str], outputs: &[&str], header: &str, source: &str) -> Self {
         let name = CString::new(name).unwrap();
         let source = CString::new(source).unwrap();
         let header = CString::new(header).unwrap();
@@ -145,7 +145,7 @@ impl Kernel {
         }
     }
 
-    fn run(&self, l: Launch) -> Result<Vec<Array>> {
+    pub(crate) fn run(&self, l: Launch) -> Result<Vec<Array>> {
         let stream = Stream::thread_local_or_default();
         unsafe {
             let cfg = sys::mlx_fast_metal_kernel_config_new();
@@ -453,8 +453,8 @@ const int K = indices_shape[1];
 uint route = i / I;
 uint j = i % I;
 float o = OUTER(route, route / K);
-float g = float(static_cast<bfloat16_t>(paired[route * 2 * I + 2 * j] * o));
-float u = float(static_cast<bfloat16_t>(paired[route * 2 * I + 2 * j + 1] * o));
+float g = float(static_cast<bfloat16_t>(float(paired[route * 2 * I + 2 * j]) * o));
+float u = float(static_cast<bfloat16_t>(float(paired[route * 2 * I + 2 * j + 1]) * o));
 float gc = caps[0] > 0.0f ? metal::precise::tanh(g / caps[0]) * caps[0] : g;
 float uc = caps[1] > 0.0f ? metal::precise::tanh(u / caps[1]) * caps[1] : u;
 float sg = 1.0f / (1.0f + metal::precise::exp(-g));
@@ -462,17 +462,17 @@ out[i] = static_cast<bfloat16_t>(gc * sg * uc * weights[route]);
 "#;
 
 // Sum each token's routed down products (times their outer scales, rounded to bf16) in f32.
+// With AT, route k of token n is row at[n * K + k] of y (and of `indices` and `amax`).
 const EXPERT_SUM_SOURCE: &str = r#"
 uint i = thread_position_in_grid.x;
 if (i >= threads_per_grid.x) return;
-const int K = indices_shape[1];
 const int W = y_shape[y_ndim - 1];
 uint n = i / W;
 uint j = i % W;
 float sum = 0.0f;
 for (int k = 0; k < K; ++k) {
-    uint route = n * K + k;
-    sum += float(static_cast<bfloat16_t>(y[route * W + j] * OUTER(route, n)));
+    uint route = AT ? at[n * K + k] : n * K + k;
+    sum += float(static_cast<bfloat16_t>(float(y[route * W + j]) * OUTER(route, n)));
 }
 out[i] = static_cast<bfloat16_t>(sum);
 "#;
@@ -964,7 +964,7 @@ impl Kernels {
                 OUTER_HEADER,
                 SWIGLU_SOURCE,
             ),
-            expert_sum: Kernel::new("inkling_expert_sum", &["y", "indices", "amax", "maxima", "denom"], &["out"], OUTER_HEADER, EXPERT_SUM_SOURCE),
+            expert_sum: Kernel::new("inkling_expert_sum", &["y", "indices", "amax", "maxima", "denom", "at"], &["out"], OUTER_HEADER, EXPERT_SUM_SOURCE),
             unembed: Kernel::new("inkling_unembed", &["x", "w", "cap"], &["out"], "", UNEMBED_SOURCE),
             shared_plan: Kernel::new("inkling_shared_plan", &["idx"], &["plan"], "", SHARED_PLAN_SOURCE),
             shared_qmm: Kernel::new("inkling_shared_qmm", &["x", "w", "scales", "idx", "plan"], &["y"], SHARED_QMM_HEADER, SHARED_QMM_SOURCE),
@@ -1223,13 +1223,16 @@ impl Kernels {
         })?.pop().unwrap())
     }
 
-    /// y [N, K, ..., W] f32 down products -> [N, W] bf16.
-    pub fn expert_sum(&self, y: &Array, indices: &Array, outer: &Outer) -> Result<Array> {
-        let (n, w) = (y.dim(0), y.dim(-1));
+    /// The down products y (W wide, f32) of `n` tokens' routes -> [n, W] bf16. `indices` and the
+    /// outer scales are in y's row order: token order, or with `at` ([n * K] u32) any order,
+    /// `at` giving the row of each token's routes.
+    pub fn expert_sum(&self, y: &Array, indices: &Array, outer: &Outer, at: Option<&Array>, n: i32) -> Result<Array> {
+        let w = y.dim(-1);
+        let k = y.size() as i32 / (n * w);
         let ([amax, maxima, denom], nv) = Self::outer_inputs(outer, y);
         Ok(self.expert_sum.run(Launch {
-            inputs: &[y, indices, amax, maxima, denom],
-            ints: &[("NV", nv), ("PER_ROUTE", outer.per_route as i32)],
+            inputs: &[y, indices, amax, maxima, denom, at.unwrap_or(indices)],
+            ints: &[("NV", nv), ("PER_ROUTE", outer.per_route as i32), ("K", k), ("AT", at.is_some() as i32)],
             dtypes: &[],
             grid: (n * w, 1, 1),
             group: (group(n * w), 1, 1),

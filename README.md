@@ -74,17 +74,51 @@ Ollama's store, so pull it with Ollama once. It is entry 4 of the menu above: pi
 ```sh
 make ollama-pull                      # ollama pull inkling-2-mini:26b-a5b-nvfp4
 make inkling-run PROMPT="..."         # Rust: one prompt
-make inkling-run IMAGE=photo.jpg PROMPT="What is in this picture?"
 make inkling-chat                     # Rust: chat (thinking is shown dimmed, then the answer)
 make rust-chat MODEL=inkling-2-mini:26b-a5b-nvfp4   # same as inkling-chat
+make run IMAGE=photo.jpg PROMPT="What is in this picture?"   # pick 4; or inkling-run IMAGE=...
 ```
 
-Images: `IMAGE=file` (or `--image file`, repeatable) shows the model a PNG, JPEG, WebP, GIF or BMP
-with the prompt; in the chat, `/image file` on a line of its own attaches one to your next
-message. The image encoder (`rust/src/inkling/vision.rs`, 0.64 GB) loads with the first image. An
-image costs one token per 40x40 pixels and is scaled down to at most 1,024 pixels a side first
-(at most 676 tokens). On a test image the prompt is token for token Ollama's and the two
-descriptions agree almost word for word.
+#### Images
+
+Inkling 2 Mini reads pictures. `IMAGE=file` on `make run`, `make chat`, `make inkling-run` or
+`make inkling-chat` (`--image file` on the runner, repeatable) shows it a PNG, JPEG, WebP, GIF or
+BMP with the prompt; with one of the Qwen models `IMAGE=` is refused instead of ignored. In the
+chat, `/image file` on a line of its own attaches a picture to your next message (several lines,
+several pictures); the picture is read while you type the question, and a file that cannot be read
+is reported without ending the chat. `~/`, quotes and a path dragged into the terminal work.
+
+```
+>>> /image ~/Pictures/chart.png
+(image attached to your next message)
+>>> Which city sold the most?
+```
+
+A picture costs one token per 40x40 pixels. Ollama feeds it at its full size (a 3,000-pixel photo
+is 5,625 tokens and takes it about 5 s to read); the Rust runner first scales a picture down to at
+most 1,024 pixels a side (676 tokens), which keeps the reading under half a second at the cost of
+fine detail. `INKLING_IMAGE_SIDE=2048` raises the limit and `INKLING_IMAGE_SIDE=0` removes it. A
+photo is turned upright by its EXIF orientation. The image encoder (`rust/src/inkling/vision.rs`,
+0.64 GB, a 23-layer vision transformer) loads with the first picture.
+
+Measured against Ollama 0.40.18 on an M5 Max with pictures of at most 1,024 pixels, where both
+feed the model the same tokens (greedy, thinking effort 0, four Rust runs and two Ollama runs of
+each, every picture new to the runner so that no cached prompt is reused):
+
+| Picture and question | Tokens | Read: Rust | Read: Ollama | Generation: Rust | Generation: Ollama |
+|---|---|---|---|---|---|
+| A page of text, transcribed (800x600) | 325 | 0.27 s | 0.27–0.28 s | 113–133 tok/s | 98–105 tok/s |
+| A bar chart, explained (1024x768) | 553 | 0.36–0.37 s | 0.38 s | 80–93 tok/s | 78–82 tok/s |
+| An abstract picture, described (1024x1024) | 702 | 0.43 s | 0.44 s | 57–59 tok/s | 50–53 tok/s |
+
+"Read" is the time from the request to the first token: encoding the picture and reading the
+prompt (for the Rust runner: the encoder's time plus the prompt's, without the few milliseconds
+of decoding the file and tokenizing). Reading is level with Ollama, within a few percent either
+way; generation is faster: on average 18% on the page, 8% on the chart (where the ranges touch)
+and 12% on the abstract picture. One Rust run in twelve, the first after Ollama's copy of the model was
+unloaded, took 0.46 s to read the page. The encoder takes 33 to 67 ms of the read (it works in
+bf16 with three fused Metal kernels; the straightforward port took 83 to 110 ms), and
+`make test` repeats the comparison on the page of text.
 
 Generation is speculative, as in Ollama: the model's
 draft network (`rust/src/inkling/draft.rs`) proposes up to seven tokens, the model checks them all
@@ -101,9 +135,11 @@ alternating the two runners:
 | Korean answer (Bitcoin, in detail) | 54.9–56.2 | 50.2–51.1 |
 
 Generation is 4 to 25% faster than Ollama's on four of these and about 5% slower on the long
-summary. Without the draft network (`INKLING_DRAFT=0`) the Rust runner makes ~50 tok/s. Ollama
-reads a prompt about twice as fast (1,860 tokens: ~2,560 tok/s against ~1,260), and it keeps the
-cache of a prompt it has seen. With the runner's default sampling (`--temp 0.7 --top-k 20`) the
+summary. Without the draft network (`INKLING_DRAFT=0`) the Rust runner makes ~50 tok/s. A prompt
+of 700 tokens is read as fast as Ollama reads it (0.35 s); Ollama is still ahead on long ones
+(about 2,560 tok/s against 1,960 at 1,860 tokens), and across requests it keeps the cache of a
+prompt it has seen. (That table was measured before the prompt reading was sped up, from 1,260
+tok/s.) With the runner's default sampling (`--temp 0.7 --top-k 20`) the
 prose answer ran at 64 tok/s; at temperature 1.5, where only 36% of proposals were accepted, it
 still made 59 tok/s. Peak memory is 20.6 GB, 22 GB with the long prompt. Loading takes about 2 s
 longer than without the draft network: it times one round at each depth, which also compiles the

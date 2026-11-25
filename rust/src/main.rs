@@ -67,7 +67,9 @@ fn main() -> Result<()> {
         let mut chat = Chat::new(engine, args.system.clone(), args.think, args.max_tokens);
         eprintln!("Chat ready. Ctrl-D or /exit to quit.");
         let stdin = std::io::stdin();
-        let mut images = args.image.clone();
+        for image in &args.image {
+            chat.attach_image(image)?;
+        }
         loop {
             print!("\n>>> ");
             std::io::stdout().flush()?;
@@ -82,14 +84,16 @@ fn main() -> Result<()> {
             if user.is_empty() {
                 continue;
             }
-            if let Some(path) = user.strip_prefix("/image ") {
-                images.push(path.trim().into());
-                eprintln!("(attached to your next message)");
+            if let Some(path) = user.strip_prefix("/image").filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace)) {
+                // The image is read and encoded now, while the question is being typed.
+                match image_path(path).and_then(|p| chat.attach_image(&p)) {
+                    Ok(()) => eprintln!("({} attached to your next message)", if chat.images_attached() == 1 { "image".to_string() } else { format!("{} images", chat.images_attached()) }),
+                    Err(e) => eprintln!("(not attached: {e:#})"),
+                }
                 continue;
             }
             let stdout = std::io::stdout();
-            let attached = std::mem::take(&mut images);
-            let (_, stats) = chat.reply_with_images(user, &attached, |t| {
+            let (_, stats) = chat.reply(user, |t| {
                 let mut lock = stdout.lock();
                 let _ = write!(lock, "{t}");
                 let _ = lock.flush();
@@ -102,6 +106,9 @@ fn main() -> Result<()> {
     }
 
     let mut cache = engine.make_cache();
+    if !args.image.is_empty() {
+        engine.warm_images()?;
+    }
     let mut prompt = format.start(None, args.think);
     for image in &args.image {
         prompt.push_str(&engine.attach_image(&mut cache, image)?);
@@ -109,4 +116,39 @@ fn main() -> Result<()> {
     prompt.push_str(&format.user(&args.prompt, args.think));
     engine.run(&prompt, &mut cache, args.max_tokens, args.print_ids)?.print();
     Ok(())
+}
+
+/// The file a `/image` line names: quotes around it and a leading `~/` are understood, as is a
+/// path dragged into the terminal (spaces escaped with backslashes).
+fn image_path(typed: &str) -> Result<std::path::PathBuf> {
+    let typed = typed.trim();
+    let typed = typed.strip_prefix('"').and_then(|t| t.strip_suffix('"')).or_else(|| typed.strip_prefix('\'').and_then(|t| t.strip_suffix('\''))).unwrap_or(typed);
+    if typed.is_empty() {
+        anyhow::bail!("give a file: /image photo.jpg");
+    }
+    let typed = if std::path::Path::new(typed).exists() { typed.to_string() } else { typed.replace("\\ ", " ") };
+    Ok(match (typed.strip_prefix("~/"), std::env::var_os("HOME")) {
+        (Some(rest), Some(home)) => std::path::Path::new(&home).join(rest),
+        _ => typed.into(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::image_path;
+    use std::path::PathBuf;
+
+    #[test]
+    fn an_image_line_names_a_file() {
+        assert_eq!(image_path(" photo.jpg ").unwrap(), PathBuf::from("photo.jpg"));
+        assert_eq!(image_path("\"my photo.jpg\"").unwrap(), PathBuf::from("my photo.jpg"));
+        assert_eq!(image_path("'my photo.jpg'").unwrap(), PathBuf::from("my photo.jpg"));
+        // A path dragged into the terminal.
+        assert_eq!(image_path("/no/such/my\\ photo.jpg").unwrap(), PathBuf::from("/no/such/my photo.jpg"));
+        assert!(image_path("").is_err());
+        assert!(image_path("  ").is_err());
+        if let Some(home) = std::env::var_os("HOME") {
+            assert_eq!(image_path("~/Pictures/a.png").unwrap(), PathBuf::from(home).join("Pictures/a.png"));
+        }
+    }
 }

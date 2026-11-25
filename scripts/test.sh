@@ -1,5 +1,5 @@
 #!/bin/zsh
-# End-to-end tests for the audio example and Jarvis: `make test`.
+# End-to-end tests for the audio example, Inkling 2 Mini's image input and Jarvis: `make test`.
 #
 # Runs the Rust unit tests, then exercises the real binaries with recordings synthesized by
 # `say`, so no microphone is needed and nothing is played aloud (speech goes to WAV files or
@@ -13,6 +13,8 @@ ROOT=$PWD
 CONDA=${CONDA:-/opt/anaconda3/bin/conda}
 ENV=${ENV:-qwen35}
 PY=$($CONDA run --no-capture-output -n $ENV python -c 'import sys; print(sys.executable)' 2>/dev/null || echo python3)
+# The binaries download a missing model with the `hf` CLI, which lives next to that python.
+case $PY in */*) PATH="$PATH:$(dirname "$PY")" ;; esac
 TMP=$(mktemp -d /tmp/jarvis-test.XXXXXX)
 trap 'rm -rf "$TMP"' EXIT
 JARVIS=rust/target/release/jarvis
@@ -127,7 +129,117 @@ out=$($PY -m unittest jarvis/python/test_helpers.py 2>&1)
 check "python unittest passes" "OK" "$out"
 check_not "python unittest has no failures" "FAILED" "$out"
 
+echo "== make: IMAGE= goes to Inkling 2 Mini only"
+out=$(make -n run MODEL=inkling-2-mini:26b-a5b-nvfp4 IMAGE=photo.jpg PROMPT=hi 2>&1)
+check "make run passes IMAGE= to the Rust runner" '--image "photo.jpg" --prompt "hi"' "$out"
+out=$(make -n chat MODEL=inkling-2-mini:26b-a5b-nvfp4 IMAGE=photo.jpg 2>&1)
+check "make chat passes IMAGE= to the Rust runner" '--image "photo.jpg" --chat' "$out"
+out=$(make run MODEL=mlx-community/Qwen3.5-4B-4bit IMAGE=photo.jpg 2>&1); code=$?
+check "IMAGE= with a model that reads no images is refused" "does not read images" "$out"
+[ $code != 0 ] && ok "and make fails" || bad "make succeeded with IMAGE= and a Qwen model" "$out"
+check "the model menu says which model reads images" "reads images" "$(scripts/choose-model.sh --list)"
+
 if [ "${1:-}" = quick ]; then echo; echo "quick: $pass passed, $fail failed"; exit $((fail > 0)); fi
+
+# ---- Inkling 2 Mini: image input in the Rust runner (weights from Ollama's store) ----
+INKLING=inkling-2-mini:26b-a5b-nvfp4
+RUNNER=rust/target/release/qwen35
+echo "== inkling: image input"
+if [ -f "$HOME/.ollama/models/manifests/registry.ollama.ai/library/${INKLING%%:*}/${INKLING##*:}" ]; then
+    # Two pictures drawn here: a page of text and a bar chart.
+    $PY -I - "$TMP" <<'PY'
+import sys
+from PIL import Image, ImageDraw, ImageFont
+out = sys.argv[1]
+font = lambda s: ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", s)
+im = Image.new("RGB", (800, 600), "white"); d = ImageDraw.Draw(im)
+d.text((40, 30), "Quarterly report", fill="black", font=font(48))
+for i, line in enumerate(["Revenue grew 12 percent to 4.8 million dollars.", "Costs fell 3 percent after the warehouse move.",
+                          "Headcount: 42 people, 5 open positions.", "Next review: 14 January, room B204."]):
+    d.text((40, 130 + 70 * i), line, fill=(20, 20, 60), font=font(30))
+im.save(out + "/page.png")
+im = Image.new("RGB", (1024, 768), (250, 250, 245)); d = ImageDraw.Draw(im)
+d.text((60, 30), "Units sold by city, 2025", fill="black", font=font(40))
+d.line((100, 660, 980, 660), fill="black", width=3); d.line((100, 120, 100, 660), fill="black", width=3)
+for i, (name, v, col) in enumerate([("Seoul", 82, (200, 60, 60)), ("Tokyo", 64, (60, 120, 200)), ("Hong Kong", 97, (60, 170, 90)),
+                                    ("Taipei", 35, (230, 160, 40)), ("Busan", 51, (140, 90, 190))]):
+    x = 150 + i * 165
+    d.rectangle((x, 660 - v * 5, x + 100, 660), fill=col)
+    d.text((x + 30, 660 - v * 5 - 40), str(v), fill="black", font=font(28))
+    d.text((x, 675), name, fill="black", font=font(26))
+im.save(out + "/chart.png")
+im.resize((3000, 2250)).save(out + "/big.jpg")
+im = Image.new("RGB", (400, 200), (30, 60, 120)); d = ImageDraw.Draw(im)
+d.text((40, 60), "PINEAPPLE 7341", fill="white", font=font(40))
+im.save(out + "/word.png")
+PY
+    ollama stop $INKLING >/dev/null 2>&1   # two copies of the model do not fit comfortably
+    out=$(INKLING_STATS=1 $RUNNER --model $INKLING --max-tokens 400 --image "$TMP/page.png" --prompt "Transcribe all the text in this image." 2>&1)
+    check "the runner reads the text on a picture" "Revenue grew 12 percent to 4.8 million dollars" "$out"
+    check "and the last line of it" "room B204" "$out"
+    check "an 800x600 picture is 20x15 tokens" "[image 20x15 tokens" "$out"
+    rust_gen=$(grep -o "gen [0-9]* tok @ [0-9.]*" <<< "$out" | tail -1 | awk '{print $5}')
+    rust_prompt=$(awk '/^\[image/ { for (i = 1; i <= NF; i++) if ($i == "encode") e = $(i + 1) + 0 } /^\[prompt/ { p = $2 / $5 } END { printf "%.3f", e + p }' <<< "$out")
+
+    out=$(make -s run MODEL=$INKLING IMAGE="$TMP/chart.png" PROMPT="Which city sold the most units, and how many?" 2>&1)
+    check "make run IMAGE=... (menu entry 4) answers from a chart" "Hong Kong" "$out"
+    check "with the number on its bar" "97" "$out"
+
+    out=$(INKLING_STATS=1 $RUNNER --model $INKLING --max-tokens 200 --image "$TMP/big.jpg" --prompt "Which city sold the fewest units?" 2>&1)
+    check "a 3000x2250 photo is scaled down to 26x20 tokens" "[image 26x20 tokens" "$out"
+    check "and still read" "Taipei" "$out"
+
+    # A chat: a mistyped file, a plain turn, two pictures in one message, then one more.
+    out=$(printf '/image %s\n/image\nSay hello in three words.\n/image %s\n/image "%s"\nWhat is the title of the first picture, and which city leads in the second? Be brief.\n/image %s\nWhat number is written in this last picture?\n' \
+        "$TMP/missing.png" "$TMP/page.png" "$TMP/chart.png" "$TMP/word.png" | make -s chat MODEL=$INKLING 2>&1)
+    check "chat: a file that cannot be read is reported" "(not attached: cannot read image $TMP/missing.png" "$out"
+    check "chat: /image without a file is reported" "(not attached: give a file" "$out"
+    check "chat: two pictures go with one message" "(2 images attached to your next message)" "$out"
+    check "chat: the first picture is read" "Quarterly report" "$out"
+    check "chat: and the second" "Hong Kong" "$out"
+    check "chat: a picture in a later turn is read" "7341" "$out"
+    [ $(grep -c "^\[prompt " <<< "$out") = 3 ] && ok "chat: the conversation went on after the bad file (three turns)" || bad "chat: expected three turns" "$out"
+
+    out=$($RUNNER --model $INKLING --image "$TMP/missing.png" --prompt "What is this?" 2>&1); code=$?
+    check "a missing --image file is an error" "cannot read image" "$out"
+    [ $code != 0 ] && ok "and the runner fails" || bad "the runner succeeded without its image"
+
+    # The same picture and question through Ollama itself: the Rust runner must not be slower.
+    if curl -s -m 3 localhost:11434/api/version >/dev/null 2>&1; then
+        speed() { # -> "PROMPT_SECONDS GEN_TOK_PER_S" for the page picture, greedy, thinking effort 0
+            python3 -I - "$TMP/page.png" <<'PY'
+import sys, json, base64, urllib.request
+body = {"model": "inkling-2-mini:26b-a5b-nvfp4", "stream": False, "think": False, "options": {"temperature": 0, "num_predict": 400},
+        "messages": [{"role": "user", "content": "Transcribe all the text in this image.", "images": [base64.b64encode(open(sys.argv[1], "rb").read()).decode()]}]}
+d = json.loads(urllib.request.urlopen(urllib.request.Request("http://localhost:11434/api/chat", json.dumps(body).encode(), {"Content-Type": "application/json"})).read())
+print("%.3f %.1f" % (d["prompt_eval_duration"] / 1e9, d["eval_count"] / (d["eval_duration"] / 1e9)))
+PY
+        }
+        # Load the model with a text prompt: Ollama keeps the cache of a prompt it has read, so
+        # the picture must be new to it when it is timed (the model was stopped above).
+        printf '{"model":"%s","prompt":"hi","stream":false,"think":false,"options":{"num_predict":1}}' $INKLING | curl -s -m 300 localhost:11434/api/generate -d @- >/dev/null
+        r=($(speed 2>/dev/null))
+        ollama stop $INKLING >/dev/null 2>&1
+        # The Rust runner again, now that the weights are back in the file cache (its first
+        # run above came straight after Ollama's copy was unloaded): the better of the two counts.
+        out=$(INKLING_STATS=1 $RUNNER --model $INKLING --max-tokens 400 --image "$TMP/page.png" --prompt "Transcribe all the text in this image." 2>&1)
+        gen2=$(grep -o "gen [0-9]* tok @ [0-9.]*" <<< "$out" | tail -1 | awk '{print $5}')
+        prompt2=$(awk '/^\[image/ { for (i = 1; i <= NF; i++) if ($i == "encode") e = $(i + 1) + 0 } /^\[prompt/ { p = $2 / $5 } END { printf "%.3f", e + p }' <<< "$out")
+        (( ${gen2:-0} > rust_gen )) && rust_gen=$gen2
+        (( ${prompt2:-9} < rust_prompt )) && rust_prompt=$prompt2
+        if [ ${#r} = 2 ]; then
+            echo "       picture and prompt read in: Rust ${rust_prompt}s, Ollama ${r[1]}s; generation: Rust ${rust_gen} tok/s, Ollama ${r[2]} tok/s"
+            (( rust_gen > r[2] )) && ok "generation after a picture is faster than Ollama's (${rust_gen} vs ${r[2]} tok/s)" || bad "generation after a picture is slower than Ollama's (${rust_gen} vs ${r[2]} tok/s)"
+            (( rust_prompt < r[1] * 1.1 )) && ok "the picture and prompt are read as fast as Ollama does, within 10% (${rust_prompt}s vs ${r[1]}s)" || bad "the picture and prompt are read more than 10% slower than Ollama does (${rust_prompt}s vs ${r[1]}s)"
+        else
+            echo "  skip Ollama did not answer: speed comparison skipped"
+        fi
+    else
+        echo "  skip Ollama is not running: speed comparison skipped"
+    fi
+else
+    echo "  skip $INKLING is not in Ollama's store (make ollama-pull)"
+fi
 
 echo "== recordings"
 say_wav q1 "What is two plus two?"

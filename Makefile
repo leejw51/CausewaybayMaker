@@ -45,10 +45,14 @@ help:
 	@echo "Each run target asks which model to use:"
 	@scripts/choose-model.sh --list
 	@echo "Skip the prompt with MODEL=..., e.g. make run MODEL=mlx-community/Qwen3.5-9B-8bit"
+	@echo "Inkling 2 Mini reads images: make run IMAGE=photo.jpg PROMPT=\"What is this?\" (pick 4), or /image photo.jpg in make chat"
 
 setup:
 	@$(CONDA) env list | grep -q "^$(ENV) " || $(CONDA) create -y -n $(ENV) python=$(PY_VER)
 	$(RUN) pip install -U mlx-lm "huggingface_hub[cli]" mlx-vlm mlx-audio "misaki[en]" mflux "pillow<12"
+
+# IMAGE=... with a model that cannot read images stops here instead of being ignored.
+NO_IMAGE = $(if $(IMAGE),echo "IMAGE= needs Inkling 2 Mini (entry 4, MODEL=inkling-2-mini:26b-a5b-nvfp4): $$M does not read images." >&2; exit 1;)
 
 # A model name without a slash is an Ollama model (Inkling 2 Mini): mlx-lm cannot run it, so
 # these targets hand it to the Rust runner, which reads it from Ollama's store.
@@ -57,12 +61,12 @@ download:
 
 run:
 	@M=$$($(PICK)) || exit 1; case $$M in \
-	  */*) $(RUN) python python/qwen.py --model $$M --max-tokens $(MAX_TOKENS) --prompt "$(PROMPT)" ;; \
+	  */*) $(NO_IMAGE) $(RUN) python python/qwen.py --model $$M --max-tokens $(MAX_TOKENS) --prompt "$(PROMPT)" ;; \
 	  *) $(MAKE) --no-print-directory rust-run MODEL=$$M ;; esac
 
 chat:
 	@M=$$($(PICK)) || exit 1; case $$M in \
-	  */*) $(RUN) python python/qwen.py --model $$M --max-tokens $(MAX_TOKENS) --chat ;; \
+	  */*) $(NO_IMAGE) $(RUN) python python/qwen.py --model $$M --max-tokens $(MAX_TOKENS) --chat ;; \
 	  *) $(MAKE) --no-print-directory rust-chat MODEL=$$M ;; esac
 
 bench:
@@ -87,11 +91,15 @@ RUST_BIN := rust/target/release/qwen35
 rust-build:
 	cd rust && cargo build --release
 
+# IMAGE=file shows Inkling 2 Mini (entry 4 of the menu) an image with the prompt; in the chat it
+# goes with the first message, and `/image file` on a line of its own attaches one to the next.
+IMAGE_FLAG = $(if $(IMAGE),--image "$(IMAGE)")
+
 rust-run: rust-build
-	@M=$$($(PICK)) || exit 1; $(RUST_BIN) --model $$M --max-tokens $(MAX_TOKENS) --prompt "$(PROMPT)"
+	@M=$$($(PICK)) || exit 1; $(RUST_BIN) --model $$M --max-tokens $(MAX_TOKENS) $(IMAGE_FLAG) --prompt "$(PROMPT)"
 
 rust-chat: rust-build
-	@M=$$($(PICK)) || exit 1; $(RUST_BIN) --model $$M --max-tokens $(MAX_TOKENS) --chat
+	@M=$$($(PICK)) || exit 1; $(RUST_BIN) --model $$M --max-tokens $(MAX_TOKENS) $(IMAGE_FLAG) --chat
 
 rust-chat2:
 	$(MAKE) rust-chat MODEL=mlx-community/Qwen3.5-4B-4bit
@@ -115,13 +123,12 @@ ollama-chat:
 
 # The same model run natively by the Rust runner (rust/src/inkling), weights read from Ollama's
 # store (pull it first). Stop Ollama's copy first if it is loaded: both need ~21 GB.
-# IMAGE=file shows the model an image with the prompt (in the chat: with the first message;
-# `/image file` on a line of its own attaches one to the next message).
+# IMAGE=file works here as in rust-run and rust-chat.
 inkling-run: rust-build
-	$(RUST_BIN) --model $(OLLAMA_MODEL) --max-tokens 2048 $(if $(IMAGE),--image "$(IMAGE)") --prompt "$(PROMPT)"
+	$(RUST_BIN) --model $(OLLAMA_MODEL) --max-tokens 2048 $(IMAGE_FLAG) --prompt "$(PROMPT)"
 
 inkling-chat: rust-build
-	$(RUST_BIN) --model $(OLLAMA_MODEL) --max-tokens 2048 $(if $(IMAGE),--image "$(IMAGE)") --chat
+	$(RUST_BIN) --model $(OLLAMA_MODEL) --max-tokens 2048 $(IMAGE_FLAG) --chat
 
 # ---- Audio (Whisper speech-to-text, rust/examples/audio) ----
 # make audio                  listen on the mic continuously; each utterance is transcribed when you pause

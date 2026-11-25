@@ -11,7 +11,7 @@ MODELS='
 mlx-community/Qwen3.5-9B-4bit   | Qwen3.5 9B  | 6 GB   | default
 mlx-community/Qwen3.5-4B-4bit   | Qwen3.5 4B  | 2.5 GB | fastest, least memory
 mlx-community/Qwen3.8-27B-4bit  | Qwen3.8 27B | 16 GB  | strongest, slowest
-inkling-2-mini:26b-a5b-nvfp4    | Inkling 2 Mini | 20 GB | Rust runner, from Ollama (ollama pull first)
+inkling-2-mini:26b-a5b-nvfp4    | Inkling 2 Mini | 20 GB | reads images (IMAGE=file); Rust runner, from Ollama (ollama pull first)
 '
 
 rows() { printf '%s\n' "$MODELS" | sed -e '/^[[:space:]]*$/d' -e 's/ *| */|/g'; }

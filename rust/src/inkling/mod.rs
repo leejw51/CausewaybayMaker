@@ -30,8 +30,11 @@ use ops::{Kernels, Outer, gather_qmm, sdpa, slice_update};
 const RESIDUAL_EPS: f32 = 1e-6;
 /// From this many tokens in a forward, expert routes are sorted so each expert runs as a batch.
 const SORT_ROUTES_FROM: i32 = 16;
-/// Tokens per prefill chunk.
-const PREFILL_CHUNK: i32 = 512;
+/// From this many tokens in a forward, the sorted expert products run in bf16 (Ollama's
+/// threshold for its grouped products).
+const BF16_PRODUCTS_FROM: i32 = 64;
+/// Most tokens per prefill chunk.
+const PREFILL_CHUNK: i32 = 1024;
 /// The SGLang reference's outer scale for NVFP4 activations: row amax / 1536.
 const NVFP4_DENOMINATOR: i32 = 1536;
 /// Rows the vocabulary kernel scores in one pass over the head.
@@ -138,6 +141,44 @@ impl Config {
 }
 
 // ---------- small helpers ----------
+
+/// Tokens per forward when `t` tokens are fed in the fewest equal chunks of at most `limit`.
+fn chunk_size(t: i32, limit: i32) -> i32 {
+    let chunks = ((t + limit - 1) / limit).max(1);
+    (t + chunks - 1) / chunks
+}
+
+/// INKLING_TRACE=1: evaluate `arrays` now and charge the time since the last mark to `name`
+/// (a breakdown of a long forward; forcing evaluation distorts short ones).
+pub(crate) fn mark(name: &'static str, arrays: &[&Array]) -> Result<()> {
+    use std::sync::{Mutex, OnceLock};
+    static ON: OnceLock<bool> = OnceLock::new();
+    static STATE: Mutex<(Option<std::time::Instant>, Vec<(&'static str, f64)>)> = Mutex::new((None, Vec::new()));
+    if !*ON.get_or_init(|| std::env::var_os("INKLING_TRACE").is_some()) {
+        return Ok(());
+    }
+    let mut state = STATE.lock().unwrap();
+    if name == "report" {
+        let total: f64 = state.1.iter().map(|x| x.1).sum();
+        for (n, t) in &state.1 {
+            eprintln!("  {n:<12} {:8.1} ms  {:4.1}%", t * 1e3, t / total * 100.0);
+        }
+        eprintln!("  {:<12} {:8.1} ms", "total", total * 1e3);
+        *state = (None, Vec::new());
+        return Ok(());
+    }
+    mlx_rs::transforms::eval(arrays.iter().copied())?;
+    let now = std::time::Instant::now();
+    if let (Some(last), false) = (state.0, name == "start") {
+        let dt = (now - last).as_secs_f64();
+        match state.1.iter_mut().find(|x| x.0 == name) {
+            Some(x) => x.1 += dt,
+            None => state.1.push((name, dt)),
+        }
+    }
+    state.0 = Some(now);
+    Ok(())
+}
 
 fn f32a(x: &Array) -> Result<Array> {
     Ok(x.as_dtype(Dtype::Float32)?)
@@ -349,6 +390,7 @@ impl Attention {
         let width = h * d;
         let rel = h * c.rel_dim;
         let kvw = kvh * d;
+        mark("mix+norm", &[qin, kin, vin])?;
         let qp = linear(qin, &self.wq)?;
         let state = match cache.conv[0].take() {
             Some(s) => s,
@@ -366,6 +408,7 @@ impl Attention {
             let (kv, next) = kern.kv(&state, (&kp, 0), (&vp, 0), &self.kv_conv, dynamic.map(|x| (x, x)), kvh, d, c.qk_clip, c.norm_eps)?;
             (kv, next, vec![(kp, 0), (vp, 0)])
         };
+        mark("qkv proj+conv", &[&qp, &kv, &next])?;
         cache.set_conv(0, next, t, state, rows);
 
         // Global layers sharpen queries past log_floor tokens: 1 + alpha * ln(max(n / floor, 1)).
@@ -378,10 +421,15 @@ impl Attention {
         };
         let (q, r) = kern.qr(&qp, &self.q_scale, &self.r_scale, tau.as_ref(), h, d, c.qk_clip, c.rel_clip)?;
         let (keys, values) = cache.append(&kv, offset, self.window)?;
+        mark("qr+append", &[&q, &r, &keys, &values])?;
         let mask = kern.attn_mask(&r, &self.pos_proj, &qp, 2 * width + rel, offset, cache.first_key, self.window, keys.dim(2))?;
+        mark("attn mask", &[&mask])?;
         let attended = sdpa(&q, &keys, &values, 1.0 / (d as f32).sqrt(), &mask, sinks)?;
+        mark("sdpa", &[&attended])?;
         let gated = kern.attn_gate(&attended, &qp, width + rel, qin.dtype())?;
-        linear(&gated, &self.wo)
+        let out = linear(&gated, &self.wo)?;
+        mark("attn out", &[&out])?;
+        Ok(out)
     }
 }
 
@@ -400,17 +448,27 @@ impl Bank {
     /// `plan` (`Kernels::shared_plan`, for a few rows): which routes share an expert, so each
     /// expert is decoded once for all the rows that use it.
     fn project(&self, k: &Kernels, x: &Array, indices: &Array, sorted: bool, plan: Option<&Array>) -> Result<(Array, Option<Array>)> {
-        let (values, amax, group, bits, mode) = if self.maxima.is_some() {
+        let (values, amax) = self.quantize(k, x)?;
+        Ok((self.product(k, &values, indices, sorted, plan)?, amax))
+    }
+
+    /// The activations as the bank's products take them (f32), and their row amax (NVFP4).
+    fn quantize(&self, k: &Kernels, x: &Array) -> Result<(Array, Option<Array>)> {
+        Ok(if self.maxima.is_some() {
             let (values, amax) = k.nvfp4(x, NVFP4_DENOMINATOR)?;
-            (values, Some(amax), 16, 4, "nvfp4")
+            (values, Some(amax))
         } else {
-            (k.mxfp8(x)?, None, 32, 8, "mxfp8")
-        };
-        let y = match plan {
-            Some(plan) => k.shared_qmm(&f32a(&values)?, &self.w, &self.scales, indices, plan, group, bits)?,
-            None => gather_qmm(&values, &self.w, &self.scales, indices, group, bits, mode, sorted)?,
-        };
-        Ok((y, amax))
+            (k.mxfp8(x)?, None)
+        })
+    }
+
+    /// Quantized activations [N, ., 1, in] times the experts `indices` picks.
+    fn product(&self, k: &Kernels, values: &Array, indices: &Array, sorted: bool, plan: Option<&Array>) -> Result<Array> {
+        let (group, bits, mode) = if self.maxima.is_some() { (16, 4, "nvfp4") } else { (32, 8, "mxfp8") };
+        match plan {
+            Some(plan) => k.shared_qmm(&f32a(values)?, &self.w, &self.scales, indices, plan, group, bits),
+            None => gather_qmm(values, &self.w, &self.scales, indices, group, bits, mode, sorted),
+        }
     }
 
     fn outer<'a>(&'a self, amax: &'a Option<Array>, per_route: bool) -> Outer<'a> {
@@ -443,6 +501,7 @@ impl Experts {
             linear(&flat32, &self.router)?
         };
         let (indices, weights) = k.route(&logits, &self.bias, c.top_k, c.route_scale)?;
+        mark("route", &[&indices, &weights])?;
         if n >= SORT_ROUTES_FROM {
             return Ok(self.sorted(c, k, &flat, &indices, &weights)?.reshape(&[b, t, w])?);
         }
@@ -451,7 +510,7 @@ impl Experts {
         let (paired, amax) = self.gate_up.project(k, &flat.reshape(&[n, 1, 1, w])?, &indices, false, plan.as_ref())?;
         let activated = k.swiglu(&paired, &indices, &self.gate_up.outer(&amax, false), &weights, c.gate_cap, c.up_cap)?;
         let (down, amax) = self.down.project(k, &activated, &indices, false, plan.as_ref())?;
-        let summed = k.expert_sum(&down, &indices, &self.down.outer(&amax, true))?;
+        let summed = k.expert_sum(&down, &indices, &self.down.outer(&amax, true), None, n)?;
         Ok(summed.reshape(&[b, t, w])?)
     }
 
@@ -467,17 +526,27 @@ impl Experts {
         let rows = order.floor_divide(Array::from_int(top))?;
         let sorted_indices = flat_indices.take_axis(&order, 0)?.reshape(&[routes, 1])?;
         let sorted_weights = weights.reshape(&[routes])?.take_axis(&order, 0)?;
-        let x = flat.take_axis(&rows, 0)?.reshape(&[routes, 1, 1, w])?;
-        let (paired, amax) = self.gate_up.project(k, &x, &sorted_indices, true, None)?;
-        let activated = k.swiglu(&paired, &sorted_indices, &self.gate_up.outer(&amax, true), &sorted_weights, c.gate_cap, c.up_cap)?;
-        let (down, amax) = self.down.project(k, &activated, &sorted_indices, true, None)?;
-        // Back to token order: route r of token n at row n * K + r.
-        let down = down.reshape(&[routes, w])?.take_axis(&inverse, 0)?.reshape(&[n, top, w])?;
+        // The activations are quantized once per token, then copied to the token's routes.
+        // Quantized activations are exact in bf16, which the batched products run fastest in;
+        // like Ollama's grouped path, from BF16_PRODUCTS_FROM tokens.
+        let bf16 = n >= BF16_PRODUCTS_FROM && std::env::var_os("INKLING_F32_PRODUCTS").is_none();
+        let narrow = |x: Array| -> Result<Array> { Ok(if bf16 { x.as_dtype(Dtype::Bfloat16)? } else { x }) };
+        let (values, amax) = self.gate_up.quantize(k, flat)?;
+        let x = narrow(values)?.take_axis(&rows, 0)?.reshape(&[routes, 1, 1, w])?;
         let amax = match amax {
-            Some(a) => Some(a.reshape(&[routes])?.take_axis(&inverse, 0)?),
+            Some(a) => Some(a.reshape(&[n])?.take_axis(&rows, 0)?),
             None => None,
         };
-        k.expert_sum(&down, indices, &self.down.outer(&amax, true))
+        mark("sort", &[&x, &sorted_indices, &sorted_weights, &inverse])?;
+        let paired = self.gate_up.product(k, &x, &sorted_indices, true, None)?;
+        mark("gate_up qmm", &[&paired])?;
+        let activated = k.swiglu(&paired, &sorted_indices, &self.gate_up.outer(&amax, true), &sorted_weights, c.gate_cap, c.up_cap)?;
+        mark("swiglu", &[&activated])?;
+        let (values, amax) = self.down.quantize(k, &activated)?;
+        let down = self.down.product(k, &narrow(values)?, &sorted_indices, true, None)?;
+        mark("down qmm", &[&down])?;
+        // The sum reads each token's routes where the sort put them.
+        k.expert_sum(&down, &sorted_indices, &self.down.outer(&amax, true), Some(&inverse), n)
     }
 }
 
@@ -574,8 +643,11 @@ impl Layer {
             }
             _ => sub.mix(k, &self.ffn_query, Some((&self.ffn_norm, c.norm_eps)))?,
         };
+        mark("attn conv+mix", &[&ffn_in])?;
         let ffn = self.ffn.forward(c, k, &ffn_in)?;
+        mark("expert sum", &[&ffn])?;
         sub.partial = self.ffn_out.forward_add(k, &ffn, &sub.partial, state.partial.dtype(), cache, 2)?;
+        mark("ffn conv", &[&sub.partial])?;
         Ok(sub)
     }
 
@@ -635,6 +707,16 @@ impl Cache {
 
     pub fn is_empty(&self) -> bool {
         self.offset == 0
+    }
+
+    /// Images attached and not yet fed.
+    pub fn images(&self) -> usize {
+        self.images.len()
+    }
+
+    /// Drop the images attached and not yet fed.
+    pub fn drop_images(&mut self) {
+        self.images.clear();
     }
 
     /// Keep only the first `keep` rows of the latest forward, as if the rest had never been
@@ -1043,7 +1125,7 @@ impl Model {
         time("gather_qmm down", &mut |_, zf| gather_qmm(&dv.add(zf)?, &l.ffn.down.w, &l.ffn.down.scales, &indices, 16, 4, "nvfp4", false))?;
         let down = gather_qmm(&dv, &l.ffn.down.w, &l.ffn.down.scales, &indices, 16, 4, "nvfp4", false)?;
         let damax = Some(damax);
-        time("expert_sum kernel", &mut |_, zf| k.expert_sum(&down.add(zf)?, &indices, &l.ffn.down.outer(&damax, true)))?;
+        time("expert_sum kernel", &mut |_, zf| k.expert_sum(&down.add(zf)?, &indices, &l.ffn.down.outer(&damax, true), None, indices.dim(0)))?;
         time("experts (whole)", &mut |zb, _| l.ffn.forward(c, k, &x.add(zb)?))?;
         for stage in 1..=6 {
             time(&format!("experts up to stage {stage}"), &mut |zb, _| {
@@ -1116,7 +1198,9 @@ impl Model {
             None => tokens,
         };
         let t = tokens.dim(1);
-        let chunk = PREFILL_CHUNK;
+        // Equal chunks of at most PREFILL_CHUNK tokens: a pass costs a fixed amount (it reads
+        // every expert), so a short last chunk would be expensive for what it feeds.
+        let chunk = chunk_size(t, std::env::var("INKLING_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(PREFILL_CHUNK));
         // With images attached, embed the whole prompt first and put them in place.
         let embedded = if cache.images.is_empty() { None } else { Some(self.embed_with_images(tokens, cache)?) };
         let mut hidden = None;
@@ -1170,18 +1254,34 @@ impl Model {
         Ok(self.vision.get().expect("just set"))
     }
 
+    /// Load the image encoder and run it once on a blank image, so that the first real image
+    /// does not pay for reading the weights and compiling the kernels.
+    pub fn warm_vision(&self) -> Result<()> {
+        self.vision()?.warm()
+    }
+
     /// Encode an image file and queue it for the next forward, whose prompt must hold a run
     /// of that many image-placeholder tokens. Returns the number of tokens.
     pub fn attach_image(&self, cache: &mut Cache, path: &std::path::Path) -> Result<usize> {
+        let t0 = std::time::Instant::now();
+        let loaded = self.vision.get().is_some();
         let vision = self.vision()?;
+        let t1 = std::time::Instant::now();
         let pixels = vision.read(path)?;
+        let t2 = std::time::Instant::now();
         cache.images.push_back(vision.encode(&pixels)?);
+        if std::env::var_os("INKLING_STATS").is_some() {
+            let load = if loaded { String::new() } else { format!("encoder loaded in {:.3}s, ", (t1 - t0).as_secs_f64()) };
+            eprintln!("[image {}x{} tokens: {load}read {:.3}s, encode {:.3}s]", pixels.cols, pixels.rows, (t2 - t1).as_secs_f64(), t2.elapsed().as_secs_f64());
+        }
         Ok(pixels.tokens())
     }
 
     /// Embeddings of a prompt [1, T] with each run of image tokens replaced by the next
     /// queued image.
     fn embed_with_images(&self, tokens: &Array, cache: &mut Cache) -> Result<Array> {
+        // Whatever happens, no image stays queued for a later prompt.
+        let mut images = std::mem::take(&mut cache.images);
         let image_token = self.image_token.context("this model's tokenizer has no image token")?;
         let ids = tokens.as_dtype(Dtype::Int32)?;
         ids.eval()?;
@@ -1195,7 +1295,7 @@ impl Model {
                 continue;
             }
             let run = ids[i..].iter().take_while(|&&id| id == image_token).count();
-            let image = cache.images.pop_front().context("the prompt has more image placeholders than images attached")?;
+            let image = images.pop_front().context("the prompt has more image placeholders than images attached")?;
             if image.dim(0) as usize != run {
                 bail!("an image of {} tokens met a placeholder of {run}", image.dim(0));
             }
@@ -1203,8 +1303,7 @@ impl Model {
             embedded = slice_update(&embedded, &image, &[0, i as i32, 0], &[1, (i + run) as i32, w])?;
             i += run;
         }
-        if !cache.images.is_empty() {
-            cache.images.clear();
+        if !images.is_empty() {
             bail!("an attached image has no placeholder in the prompt ({t} tokens)");
         }
         Ok(embedded)
@@ -1225,6 +1324,7 @@ impl Model {
         let t = embedded.dim(1);
         let taps: &[usize] = self.draft.as_ref().map_or(&[], |d| d.taps());
         let mut features: Vec<Array> = Vec::with_capacity(taps.len());
+        mark("start", &[&embedded])?;
         let mut state = Residual { blocks: Vec::new(), partial: embedded };
         let mut prelude: Option<Residual> = None;
         let mut previous: Vec<Array> = Vec::new();
@@ -1260,6 +1360,53 @@ impl Model {
             features.push(f32a(&hidden)?);
             dc.queue(concatenate(&features, -1)?);
         }
+        mark("output", &[&hidden])?;
+        mark("report", &[])?;
         Ok(hidden)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_prompt_is_fed_in_equal_chunks() {
+        assert_eq!(chunk_size(1, 1024), 1);
+        assert_eq!(chunk_size(553, 1024), 553);
+        assert_eq!(chunk_size(1024, 1024), 1024);
+        // Not 1,024 and then a costly pass over 76 tokens.
+        assert_eq!(chunk_size(1100, 1024), 550);
+        assert_eq!(chunk_size(2049, 1024), 683);
+        for t in 1..5000 {
+            let chunk = chunk_size(t, 1024);
+            assert!(chunk <= 1024 && (t + chunk - 1) / chunk == (t + 1023) / 1024, "{t} tokens in chunks of {chunk}");
+        }
+    }
+
+    #[test]
+    fn the_expert_sum_reads_routes_wherever_the_sort_put_them() {
+        let k = Kernels::new();
+        let (n, routes, w) = (3, 4, 6);
+        let y: Vec<f32> = (0..n * routes * w).map(|i| ((i * 31 % 97) as f32 - 48.0) / 8.0).collect();
+        let indices = Array::from_slice(&(0..(n * routes) as u32).map(|i| i * 7 % 5).collect::<Vec<_>>(), &[n, routes]);
+        let plain = Outer { nvfp4: None, per_route: true };
+        let in_order = k.expert_sum(&Array::from_slice(&y, &[n, routes, w]), &indices, &plain, None, n).unwrap();
+        // The same rows, shuffled: row `at[r]` holds route r.
+        let at: Vec<u32> = (0..(n * routes) as u32).map(|r| (r * 5 + 3) % (n * routes) as u32).collect();
+        let mut shuffled = vec![0f32; y.len()];
+        for (r, &row) in at.iter().enumerate() {
+            shuffled[row as usize * w as usize..(row as usize + 1) * w as usize].copy_from_slice(&y[r * w as usize..(r + 1) * w as usize]);
+        }
+        let moved = k.expert_sum(&Array::from_slice(&shuffled, &[n * routes, w]), &indices, &plain, Some(&Array::from_slice(&at, &[n * routes])), n).unwrap();
+        let read = |a: &Array| {
+            let a = f32a(a).unwrap();
+            a.eval().unwrap();
+            a.as_slice::<f32>().to_vec()
+        };
+        assert_eq!(read(&in_order), read(&moved));
+        // And it is the sum over each token's routes.
+        let first: f32 = (0..routes as usize).map(|r| y[r * w as usize]).sum();
+        assert!((read(&in_order)[0] - first).abs() < 0.05, "{} vs {first}", read(&in_order)[0]);
     }
 }
