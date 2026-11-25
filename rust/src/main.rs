@@ -41,6 +41,10 @@ struct Args {
     /// Print generated token ids (for comparing against the Python run)
     #[arg(long)]
     print_ids: bool,
+    /// Inkling: an image file to show with the prompt (repeatable). In --chat it goes with the
+    /// first message; `/image <file>` on a line of its own attaches one to the next message.
+    #[arg(long)]
+    image: Vec<std::path::PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -63,6 +67,7 @@ fn main() -> Result<()> {
         let mut chat = Chat::new(engine, args.system.clone(), args.think, args.max_tokens);
         eprintln!("Chat ready. Ctrl-D or /exit to quit.");
         let stdin = std::io::stdin();
+        let mut images = args.image.clone();
         loop {
             print!("\n>>> ");
             std::io::stdout().flush()?;
@@ -77,8 +82,14 @@ fn main() -> Result<()> {
             if user.is_empty() {
                 continue;
             }
+            if let Some(path) = user.strip_prefix("/image ") {
+                images.push(path.trim().into());
+                eprintln!("(attached to your next message)");
+                continue;
+            }
             let stdout = std::io::stdout();
-            let (_, stats) = chat.reply(user, |t| {
+            let attached = std::mem::take(&mut images);
+            let (_, stats) = chat.reply_with_images(user, &attached, |t| {
                 let mut lock = stdout.lock();
                 let _ = write!(lock, "{t}");
                 let _ = lock.flush();
@@ -90,8 +101,12 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let prompt = format.start(None, args.think) + &format.user(&args.prompt, args.think);
     let mut cache = engine.make_cache();
+    let mut prompt = format.start(None, args.think);
+    for image in &args.image {
+        prompt.push_str(&engine.attach_image(&mut cache, image)?);
+    }
+    prompt.push_str(&format.user(&args.prompt, args.think));
     engine.run(&prompt, &mut cache, args.max_tokens, args.print_ids)?.print();
     Ok(())
 }

@@ -115,11 +115,13 @@ ollama-chat:
 
 # The same model run natively by the Rust runner (rust/src/inkling), weights read from Ollama's
 # store (pull it first). Stop Ollama's copy first if it is loaded: both need ~21 GB.
+# IMAGE=file shows the model an image with the prompt (in the chat: with the first message;
+# `/image file` on a line of its own attaches one to the next message).
 inkling-run: rust-build
-	$(RUST_BIN) --model $(OLLAMA_MODEL) --max-tokens 2048 --prompt "$(PROMPT)"
+	$(RUST_BIN) --model $(OLLAMA_MODEL) --max-tokens 2048 $(if $(IMAGE),--image "$(IMAGE)") --prompt "$(PROMPT)"
 
 inkling-chat: rust-build
-	$(RUST_BIN) --model $(OLLAMA_MODEL) --max-tokens 2048 --chat
+	$(RUST_BIN) --model $(OLLAMA_MODEL) --max-tokens 2048 $(if $(IMAGE),--image "$(IMAGE)") --chat
 
 # ---- Audio (Whisper speech-to-text, rust/examples/audio) ----
 # make audio                  listen on the mic continuously; each utterance is transcribed when you pause

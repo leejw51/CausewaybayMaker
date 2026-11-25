@@ -50,6 +50,12 @@ pub mod inkling_format {
     pub fn user(user: &str) -> String {
         format!("<|message_user|><|content_text|>{user}<|end_message|>")
     }
+
+    /// A user message holding one image of `tokens` placeholder tokens; it goes before the
+    /// message's text.
+    pub fn image(tokens: usize) -> String {
+        format!("<|message_user|><|content_image|>{}<|end_message|>", crate::inkling::vision::IMAGE_TOKEN.repeat(tokens))
+    }
 }
 
 /// Which prompt format and stop tokens a model uses.
@@ -222,8 +228,10 @@ impl Engine {
             anyhow::bail!("{spec}: only Inkling 2 models can be run from Ollama's store (this one is {arch:?})");
         }
         let t0 = Instant::now();
-        let model = Backend::Inkling(inkling::Model::load(&manifest)?);
+        let mut model = inkling::Model::load(&manifest)?;
         let tok = Tokenizer::from_file(manifest.file("tokenizer.json")?).map_err(anyhow::Error::msg)?;
+        model.image_token = tok.token_to_id(inkling::vision::IMAGE_TOKEN).map(|id| id as i32);
+        let model = Backend::Inkling(model);
         let id = |t: &str| tok.token_to_id(t).ok_or_else(|| anyhow::anyhow!("tokenizer has no {t}"));
         let eos = vec![id(inkling_format::END_SAMPLING)?, id("<|endoftext|>")?];
         let sections = (id(inkling_format::THINKING)?, id(inkling_format::TEXT)?);
@@ -237,6 +245,15 @@ impl Engine {
 
     pub fn make_cache(&self) -> Cache {
         self.model.make_cache()
+    }
+
+    /// Attach an image file to the next prompt fed to `cache` (Inkling only). Returns the
+    /// message to put in that prompt, before the text of the user's turn.
+    pub fn attach_image(&self, cache: &mut Cache, path: &std::path::Path) -> Result<String> {
+        match (&self.model, cache) {
+            (Backend::Inkling(m), Cache::Inkling(c)) => Ok(inkling_format::image(m.attach_image(c, path)?)),
+            _ => anyhow::bail!("{} does not take images here", self.format.label()),
+        }
     }
 
     /// Generate from `prompt`, handing decoded text to `on_text` as it arrives (partial UTF-8
@@ -437,8 +454,16 @@ impl Chat {
     /// Send one user message; the reply streams to `on_text` and is returned whole.
     /// `on_text` returns false to cut the reply short.
     pub fn reply(&mut self, user: &str, on_text: impl FnMut(&str) -> bool) -> Result<(String, Stats)> {
+        self.reply_with_images(user, &[], on_text)
+    }
+
+    /// `reply` with image files shown to the model before the message's text (Inkling only).
+    pub fn reply_with_images(&mut self, user: &str, images: &[std::path::PathBuf], on_text: impl FnMut(&str) -> bool) -> Result<(String, Stats)> {
         let format = self.engine.format;
         let mut prompt = if self.started { self.prefix.to_string() } else { format.start(self.system.as_deref(), self.think) };
+        for image in images {
+            prompt.push_str(&self.engine.attach_image(&mut self.cache, image)?);
+        }
         prompt.push_str(&format.user(user, self.think));
         let (text, stats) = self.engine.generate_text(&prompt, &mut self.cache, self.max_tokens, on_text)?;
         self.started = true;
@@ -458,6 +483,14 @@ mod tests {
         assert_eq!(build_prompt("hi", false), "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n");
         assert_eq!(build_prompt("hi", true), "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n");
         assert_eq!(system_prompt("Be brief."), "<|im_start|>system\nBe brief.<|im_end|>\n");
+    }
+
+    #[test]
+    fn an_inkling_image_is_its_own_message_of_placeholders() {
+        assert_eq!(
+            inkling_format::image(2),
+            "<|message_user|><|content_image|><|unused_200054|><|unused_200054|><|end_message|>"
+        );
     }
 
     #[test]

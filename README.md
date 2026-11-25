@@ -74,11 +74,19 @@ Ollama's store, so pull it with Ollama once. It is entry 4 of the menu above: pi
 ```sh
 make ollama-pull                      # ollama pull inkling-2-mini:26b-a5b-nvfp4
 make inkling-run PROMPT="..."         # Rust: one prompt
+make inkling-run IMAGE=photo.jpg PROMPT="What is in this picture?"
 make inkling-chat                     # Rust: chat (thinking is shown dimmed, then the answer)
 make rust-chat MODEL=inkling-2-mini:26b-a5b-nvfp4   # same as inkling-chat
 ```
 
-Text only: the image encoder is not loaded. Generation is speculative, as in Ollama: the model's
+Images: `IMAGE=file` (or `--image file`, repeatable) shows the model a PNG, JPEG, WebP, GIF or BMP
+with the prompt; in the chat, `/image file` on a line of its own attaches one to your next
+message. The image encoder (`rust/src/inkling/vision.rs`, 0.64 GB) loads with the first image. An
+image costs one token per 40x40 pixels and is scaled down to at most 1,024 pixels a side first
+(at most 676 tokens). On a test image the prompt is token for token Ollama's and the two
+descriptions agree almost word for word.
+
+Generation is speculative, as in Ollama: the model's
 draft network (`rust/src/inkling/draft.rs`) proposes up to seven tokens, the model checks them all
 in one pass, and the run it agrees with is kept along with its own next token. Measured on an M5
 Max: greedy, thinking effort 0 on both, each answer run to its end, two runs of each prompt,

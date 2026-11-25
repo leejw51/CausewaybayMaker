@@ -1,6 +1,7 @@
 //! Inkling 2 Mini (`inkling2_loop`): a 26B-total / 5B-active routed-expert model with relative
 //! position attention, short convolutions, attention over residual blocks and a looped middle
-//! section (layers 6..18 run three times). Text only: the vision tower is not loaded. The draft
+//! section (layers 6..18 run three times). The image encoder (`vision.rs`) is loaded when the
+//! first image is attached. The draft
 //! network for speculative decoding is in `draft.rs`, and the decoder that uses it in
 //! `speculate.rs`.
 //!
@@ -12,6 +13,7 @@ pub mod draft;
 pub mod ollama;
 pub mod ops;
 pub mod speculate;
+pub mod vision;
 
 use std::collections::HashMap;
 
@@ -620,6 +622,9 @@ pub struct Cache {
     pub(crate) pending: Option<i32>,
     /// The draft network's state (when the model has one).
     pub draft: Option<draft::Cache>,
+    /// Encoded images ([tokens, W] each) waiting for their placeholder tokens: the next
+    /// forward puts them in place of each run of image tokens, in order.
+    images: std::collections::VecDeque<Array>,
 }
 
 impl Cache {
@@ -714,6 +719,11 @@ pub struct Model {
     sinks: Array,
     /// The draft network that proposes tokens for speculative decoding, if loaded.
     pub draft: Option<draft::Draft>,
+    /// Where the weights are, for the image encoder, which loads on first use.
+    manifest: Manifest,
+    vision: std::sync::OnceLock<vision::Vision>,
+    /// The id of the image-placeholder token (set by whoever owns the tokenizer).
+    pub image_token: Option<i32>,
 }
 
 struct Weights(HashMap<String, Array>);
@@ -869,7 +879,7 @@ impl Model {
         }
         let plan = cfg.plan();
         let sinks = zeros::<f32>(&[cfg.heads])?;
-        let mut model = Self { cfg, plan, embed, embed_norm, out_norm, out_query, unembed, layers, kernels: Kernels::new(), sinks, draft: None };
+        let mut model = Self { cfg, plan, embed, embed_norm, out_norm, out_query, unembed, layers, kernels: Kernels::new(), sinks, draft: None, manifest: m.clone(), vision: Default::default(), image_token: None };
         model.eval_weights()?;
         // INKLING_DRAFT=0 decodes one token per pass, without the draft network.
         if std::env::var("INKLING_DRAFT").map_or(true, |v| v != "0") && m.files.contains_key("draft/config.json") {
@@ -1083,6 +1093,7 @@ impl Model {
             rows: 0,
             pending: None,
             draft: self.draft.as_ref().map(|d| d.make_cache()),
+            images: Default::default(),
         }
     }
 
@@ -1106,11 +1117,16 @@ impl Model {
         };
         let t = tokens.dim(1);
         let chunk = PREFILL_CHUNK;
+        // With images attached, embed the whole prompt first and put them in place.
+        let embedded = if cache.images.is_empty() { None } else { Some(self.embed_with_images(tokens, cache)?) };
         let mut hidden = None;
         let mut start = 0;
         while start < t {
             let end = (start + chunk).min(t);
-            let out = self.step(&tokens.index((.., start..end)), cache)?;
+            let out = match &embedded {
+                Some(e) => self.step_embedded(e.index((.., start..end, ..)), cache)?,
+                None => self.step(&tokens.index((.., start..end)), cache)?,
+            };
             if let (Some(d), Some(dc)) = (&self.draft, &mut cache.draft) {
                 d.flush_if_full(dc)?;
             }
@@ -1146,17 +1162,70 @@ impl Model {
         model_rms(&self.embed.take_axis(tokens, 0)?, &self.embed_norm, self.cfg.norm_eps)
     }
 
+    /// The image encoder, loaded on first use.
+    pub fn vision(&self) -> Result<&vision::Vision> {
+        if self.vision.get().is_none() {
+            let _ = self.vision.set(vision::Vision::load(&self.manifest)?);
+        }
+        Ok(self.vision.get().expect("just set"))
+    }
+
+    /// Encode an image file and queue it for the next forward, whose prompt must hold a run
+    /// of that many image-placeholder tokens. Returns the number of tokens.
+    pub fn attach_image(&self, cache: &mut Cache, path: &std::path::Path) -> Result<usize> {
+        let vision = self.vision()?;
+        let pixels = vision.read(path)?;
+        cache.images.push_back(vision.encode(&pixels)?);
+        Ok(pixels.tokens())
+    }
+
+    /// Embeddings of a prompt [1, T] with each run of image tokens replaced by the next
+    /// queued image.
+    fn embed_with_images(&self, tokens: &Array, cache: &mut Cache) -> Result<Array> {
+        let image_token = self.image_token.context("this model's tokenizer has no image token")?;
+        let ids = tokens.as_dtype(Dtype::Int32)?;
+        ids.eval()?;
+        let ids = ids.as_slice::<i32>().to_vec();
+        let mut embedded = self.embed(tokens)?;
+        let (t, w) = (embedded.dim(1), embedded.dim(2));
+        let mut i = 0;
+        while i < ids.len() {
+            if ids[i] != image_token {
+                i += 1;
+                continue;
+            }
+            let run = ids[i..].iter().take_while(|&&id| id == image_token).count();
+            let image = cache.images.pop_front().context("the prompt has more image placeholders than images attached")?;
+            if image.dim(0) as usize != run {
+                bail!("an image of {} tokens met a placeholder of {run}", image.dim(0));
+            }
+            let image = image.reshape(&[1, run as i32, w])?.as_dtype(embedded.dtype())?;
+            embedded = slice_update(&embedded, &image, &[0, i as i32, 0], &[1, (i + run) as i32, w])?;
+            i += run;
+        }
+        if !cache.images.is_empty() {
+            cache.images.clear();
+            bail!("an attached image has no placeholder in the prompt ({t} tokens)");
+        }
+        Ok(embedded)
+    }
+
     /// One forward over tokens [1, T]: returns the normalized output rows [1, T, W] (bf16). The
     /// cache can take back trailing rows afterwards (`Cache::rollback`). With a draft network,
     /// its input features for these rows are queued in the draft cache.
     pub fn step(&self, tokens: &Array, cache: &mut Cache) -> Result<Array> {
+        self.step_embedded(self.embed(tokens)?, cache)
+    }
+
+    /// `step` from input embeddings [1, T, W].
+    fn step_embedded(&self, embedded: Array, cache: &mut Cache) -> Result<Array> {
         let c = &self.cfg;
         let k = &self.kernels;
         let offset = cache.offset;
-        let t = tokens.dim(1);
+        let t = embedded.dim(1);
         let taps: &[usize] = self.draft.as_ref().map_or(&[], |d| d.taps());
         let mut features: Vec<Array> = Vec::with_capacity(taps.len());
-        let mut state = Residual { blocks: Vec::new(), partial: self.embed(tokens)? };
+        let mut state = Residual { blocks: Vec::new(), partial: embedded };
         let mut prelude: Option<Residual> = None;
         let mut previous: Vec<Array> = Vec::new();
         for (i, &(layer_index, pass)) in self.plan.iter().enumerate() {

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
+#[derive(Clone)]
 pub struct Manifest {
     pub name: String,
     pub blobs: PathBuf,

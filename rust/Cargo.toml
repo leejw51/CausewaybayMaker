@@ -15,4 +15,6 @@ cpal = "0.18"
 half = "2"
 hound = "3.5"
 libc = "0.2"
+# Image input for Inkling 2 (src/inkling/vision.rs).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
 zip = { version = "9", default-features = false, features = ["deflate"] }
